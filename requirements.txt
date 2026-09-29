@@ -8,3 +8,4 @@ socceraction
 shapely
 scipy
 scikit-learn
+onnxruntime

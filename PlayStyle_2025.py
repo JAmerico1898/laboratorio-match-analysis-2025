@@ -1,3 +1,4 @@
+# Superseded by MatchAnalysis_PlayStyle_2025.py; metric code not aligned with plataforma-scouting.
 #%%
 # PlayStyle 2025 - Orchestrator
 import pandas as pd
@@ -134,6 +135,21 @@ events = ws.read_events()
 
 # Game schedule
 df_schedule = ws.read_schedule()
+
+# Strip timezone from all datetime columns, then export
+df_schedule_export = df_schedule.copy()
+
+for col in df_schedule_export.select_dtypes(include=['datetimetz']).columns:
+    df_schedule_export[col] = df_schedule_export[col].dt.tz_localize(None)
+
+# Creating excel file to rodadas
+# Strip timezone from all datetime columns, then export
+df_schedule_export = df_schedule.copy()
+
+for col in df_schedule_export.select_dtypes(include=['datetimetz']).columns:
+    df_schedule_export[col] = df_schedule_export[col].dt.tz_localize(None)
+
+df_schedule_export.to_excel("df_schedule.xlsx", index=False)
 
 #####################################################################################
 #####################################################################################
@@ -572,7 +588,9 @@ variable_df = (
     .reset_index(drop=True)  # Reset index for a clean dataframe
 )
 
+# Creating variable_ps dataframe
 variable_ps = variable_df.copy()
+
 ###############################################################################
 ###############################################################################
 ###############################################################################
@@ -3660,7 +3678,7 @@ variable_ps_new.insert(0, "Temporada", 2025)
 ###########################################################################
 ###########################################################################
 
-# Building round column
+# Numbering rounds
 # Numbering rounds
 # 1. Load the rounds reference file and keep only the keys we need
 rodada_df = pd.read_excel('rodada_2025.xlsx')[['game_id', 'round']]
@@ -3676,7 +3694,6 @@ cols = list(variable_ps_new.columns)
 cols.remove('round')      # Remove 'round' from its current position
 cols.insert(1, 'round')   # Insert 'round' at index 1
 variable_ps_new = variable_ps_new[cols]
-
 ###########################################################################
 ###########################################################################
 

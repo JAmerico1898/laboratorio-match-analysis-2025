@@ -16,13 +16,13 @@ from multimethod import multimethod
 from multimethod import overload
 from socceraction.data.opta import OptaLoader
 import socceraction.spadl as spadl
-import socceraction.xthreat as xthreat
+#import socceraction.xthreat as xthreat
 from shapely.geometry import Point, Polygon
 from scipy.spatial import ConvexHull
 from scipy.stats import zscore
 from scipy.stats import rankdata
-from sklearn.model_selection import train_test_split
-import pickle
+#from sklearn.model_selection import train_test_split
+#import pickle
 from tqdm import tqdm
 from scipy.stats import poisson
 
@@ -32,6 +32,21 @@ warnings.filterwarnings('ignore')
 ###############################################################################
 ###############################################################################
 
+#Collecting data
+
+ws = sd.WhoScored(leagues="BRA-Brasileirão", seasons=2025)
+
+# Scrape all games and return a OptaLoader object
+loader = ws.read_events(output_fmt='loader')
+
+# Game events
+events = ws.read_events()
+
+# Game schedule
+df_schedule = ws.read_schedule()
+
+###############################################################################
+###############################################################################
 
 game_ids = [
     1889883, 1889884, 1889885, 1889886, 1889887, 1889888, 1889889, 1889890,
@@ -124,16 +139,6 @@ for script in upstream_scripts:
         raise RuntimeError(f"{script} failed")
     print(f"  {script} completed")
 
-ws = sd.WhoScored(leagues="BRA-Brasileirão", seasons=2025)
-
-# Scrape all games and return a OptaLoader object
-loader = ws.read_events(output_fmt='loader')
-
-# Game events
-events = ws.read_events()
-
-# Game schedule
-df_schedule = ws.read_schedule()
 
 #####################################################################################
 #####################################################################################
@@ -210,6 +215,7 @@ df = df[columns]
 ###############################################################################
 #Load Data
 
+
 # Create the "fixture" column
 df_schedule['fixture'] = (
     df_schedule['home_team'].astype(str) + " " + 
@@ -248,97 +254,77 @@ df.drop(columns=["player_id"], inplace=True)
 ###########################################################################################
 
 # Adicionar tipos de eventos não cobertos pela Opta
-# CARRIES & PROGRESSIVE CARRIES
-# Carry: any ball movement by the same team (prev_end != current_start).
-# Progressive carry: a carry moving >=5m closer to goal (start outside final 40%,
-#   i.e. prev_end_x < 60) or >=2.5m closer (start inside final 40%, prev_end_x >= 60).
-# Carry and progressive carry are mutually exclusive: type_id 2000 vs 1000.
-# Opta coordinates are 0-100 %; distance-to-goal in meters = (100 - x) * 1.05.
-
-PITCH_LENGTH_M = 105.0
+# CARRIES & PROGRESSIVE CARRIES — plataforma-scouting rule (docs/variable_consistency_decisions.md D1), taken from
+# the reference stage-01 frame that possession_chain.py writes (ref_pipeline.REF_STAGE01):
+#   carry (2000): same game/period/chain/team, forward x gain > 5 Opta units, gap <= 30 s, not after a failed pass,
+#     not into a defensive action/duel or a committed foul;
+#   progressive carry (1000): a carry that starts at x >= 50.
+# A reference carry row carries the WhoScored id of the event it leads into; it is inserted just before that event.
+# Reference chain columns (chain_id, is_chain_team, chain_first, chain_last) are attached to every row; events the
+# reference preprocess drops (e.g. saves, admin events) get chain_id NaN.
+import team_concepts as tc
+from ref_pipeline import REF_STAGE01
 
 progcarry_df = df.copy()
-
-if 'event_index' not in progcarry_df.columns:
-    progcarry_df['event_index'] = np.arange(len(progcarry_df), dtype=float)
-
-# Sort chronologically before any shift work
-progcarry_df.sort_values(
-    ["game_id", "period_id", "time", "event_id"],
-    kind="mergesort",
-    inplace=True,
-)
+progcarry_df.sort_values(["game_id", "period_id", "time", "event_id"], kind="mergesort", inplace=True)
 progcarry_df.reset_index(drop=True, inplace=True)
+progcarry_df["event_index"] = np.arange(len(progcarry_df), dtype=float)
 
-# Shifted columns for previous event (within same game & period)
-progcarry_df["prev_end_x"]   = progcarry_df.groupby(["game_id", "period_id"])["end_x"].shift(1)
-progcarry_df["prev_end_y"]   = progcarry_df.groupby(["game_id", "period_id"])["end_y"].shift(1)
-progcarry_df["prev_team_id"] = progcarry_df.groupby(["game_id", "period_id"])["team_id"].shift(1)
+_ref = pd.read_parquet(REF_STAGE01, columns=["game_id", "id", "event_idx", "type_id", "team_id", "period_id", "x", "y",
+                                             "end_x", "end_y", "chain_id", "is_chain_team", "chain_first", "chain_last"])
+_ref = _ref.rename(columns={"id": "event_id"})
+_ref_carry = _ref["type_id"].isin(tc.CARRY_TYPES)
+_chain_cols = ["chain_id", "is_chain_team", "chain_first", "chain_last"]
 
-# --- Carry detection: same team, ball moved ---
-same_team = progcarry_df["team_id"] == progcarry_df["prev_team_id"]
-ball_moved = (
-    (progcarry_df["start_x"] != progcarry_df["prev_end_x"])
-    | (progcarry_df["start_y"] != progcarry_df["prev_end_y"])
-)
-is_carry = same_team & ball_moved & progcarry_df["prev_end_x"].notna()
+progcarry_df = progcarry_df.merge(_ref.loc[~_ref_carry, ["game_id", "event_id", "event_idx"] + _chain_cols],
+                                  on=["game_id", "event_id"], how="left", validate="one_to_one")
+# Reference event order (event_idx = JSON order): the loss/regain definitions look at the next and previous event, so
+# same-second events must be in the reference's order. An event the reference drops keeps its place after the
+# preceding event.
+_idx = progcarry_df["event_idx"].astype(float)
+progcarry_df["event_index"] = _idx.fillna(_idx.groupby(progcarry_df["game_id"]).ffill() + 0.25).fillna(-1.0)
+progcarry_df.drop(columns="event_idx", inplace=True)
 
-# --- Progressive carry: distance-to-goal decreased by threshold ---
-dist_to_goal_prev = (100.0 - progcarry_df["prev_end_x"]) * (PITCH_LENGTH_M / 100.0)
-dist_to_goal_curr = (100.0 - progcarry_df["start_x"])     * (PITCH_LENGTH_M / 100.0)
-gain_m = dist_to_goal_prev - dist_to_goal_curr  # positive = moved closer to goal
-
-outside_final_40 = progcarry_df["prev_end_x"] < 60  # outside final 40% of pitch
-is_prog = is_carry & (
-    (outside_final_40  & (gain_m >= 5.0))
-    | (~outside_final_40 & (gain_m >= 2.5))
-)
-
-# --- Mutually exclusive flags ---
-progcarry_df["carry"]      = (is_carry & ~is_prog).astype(int)
-progcarry_df["prog_carry"] = is_prog.astype(int)
-
-# --- Build synthetic carry rows (vectorized) ---
-carry_mask = is_carry  # all carries (both regular and progressive)
-carry_src = progcarry_df.loc[carry_mask].copy()
+_c = _ref.loc[_ref_carry].reset_index(drop=True)
+_lead = progcarry_df.drop_duplicates(["game_id", "event_id"]).set_index(["game_id", "event_id"])
+_keys = pd.MultiIndex.from_frame(_c[["game_id", "event_id"]])
+_missing = ~_keys.isin(_lead.index)
+if _missing.any():
+    raise RuntimeError(f"{int(_missing.sum())} reference carries lead into events missing from progcarry_df")
+_l = _lead.loc[_keys]
 
 carry_rows = pd.DataFrame({
-    "type_name":  np.where(carry_src["prog_carry"] == 1, "progressive carry", "carry"),
-    "type_id":    np.where(carry_src["prog_carry"] == 1, 1000, 2000),
-    "start_x":    carry_src["prev_end_x"].values,
-    "start_y":    carry_src["prev_end_y"].values,
-    "end_x":      carry_src["start_x"].values,
-    "end_y":      carry_src["start_y"].values,
-    "team_id":    carry_src["team_id"].values,
-    "team_name":  carry_src["team_name"].values,
-    "game_id":    carry_src["game_id"].values,
-    "fixture":    carry_src["fixture"].values,
-    "period_id":  carry_src["period_id"].values,
-    "event_id":   carry_src["event_id"].values,
-    "outcome":    carry_src["outcome"].values,
-    "touch":      True,
-    "goal":       False,
-    "shot":       False,
-    "timestamp":  carry_src["timestamp"].values,
-    "minute":     carry_src["minute"].values,
-    "second":     carry_src["second"].values,
-    "time":       carry_src["time"].values,
-    "event_index": carry_src["event_index"].values - 0.5,
-    "carry":      np.where(carry_src["prog_carry"] == 1, 0, np.nan),
-    "prog_carry": np.where(carry_src["prog_carry"] == 1, np.nan, 0),
+    "type_name":     np.where(_c["type_id"] == 1000, "progressive carry", "carry"),
+    "type_id":       _c["type_id"].to_numpy(),
+    "start_x":       _c["x"].to_numpy(),
+    "start_y":       _c["y"].to_numpy(),
+    "end_x":         _c["end_x"].to_numpy(),
+    "end_y":         _c["end_y"].to_numpy(),
+    "team_id":       _c["team_id"].to_numpy(),
+    "team_name":     _l["team_name"].to_numpy(),
+    "game_id":       _c["game_id"].to_numpy(),
+    "fixture":       _l["fixture"].to_numpy(),
+    "period_id":     _c["period_id"].to_numpy(),
+    "event_id":      _c["event_id"].to_numpy(),
+    "outcome":       True,  # reference sets carry outcome = 1 (B11)
+    "touch":         True,
+    "goal":          False,
+    "shot":          False,
+    "timestamp":     _l["timestamp"].to_numpy(),
+    "minute":        _l["minute"].to_numpy(),
+    "second":        _l["second"].to_numpy(),
+    "time":          _l["time"].to_numpy(),
+    "event_index":   _l["event_index"].to_numpy() - 0.5,
+    "chain_id":      _c["chain_id"].to_numpy(),
+    "is_chain_team": _c["is_chain_team"].to_numpy(),
+    "chain_first":   False,
+    "chain_last":    False,
 })
 
-# Concatenate and sort
 progcarry_df = pd.concat([progcarry_df, carry_rows], ignore_index=True)
-progcarry_df.sort_values(
-    ["game_id", "period_id", "event_index"],
-    kind="mergesort",
-    inplace=True,
-)
+progcarry_df.sort_values(["game_id", "period_id", "event_index"], kind="mergesort", inplace=True)
 progcarry_df.reset_index(drop=True, inplace=True)
-
-# Drop intermediate columns
-progcarry_df.drop(columns=["prev_end_x", "prev_end_y", "prev_team_id"], inplace=True)
+progcarry_df = tc.add_qualifier_flags(progcarry_df)
 
 ##########################################################################
 ##########################################################################
@@ -390,6 +376,17 @@ progcarry_chains_df.rename(columns={
 xg_df = pd.read_parquet("xG_brasileirao_2025.parquet")
 xg_df.rename(columns={"teamId": "team_id", "id": "event_id"}, inplace=True)
 
+# Merge xG once, onto shot rows only (type_id 13-16): a carry row shares its event_id with the event it
+# leads into and must not inherit that shot's xG. Own goals are not in xg_df and get 0.
+progcarry_df = progcarry_df.merge(
+    xg_df[["game_id", "event_id", "xG"]],
+    on=["game_id", "event_id"],
+    how="left",
+)
+progcarry_df["xG"] = progcarry_df["xG"].where(progcarry_df["type_id"].isin([13, 14, 15, 16])).fillna(0.0)
+if (progcarry_df["xG"] != 0).sum() == 0:
+    raise RuntimeError("xG merge produced all-zero xG column — event_id key space drift between xg_df and progcarry_df")
+
 ##########################################################################
 ##########################################################################
 ##########################################################################
@@ -399,20 +396,38 @@ xg_df.rename(columns={"teamId": "team_id", "id": "event_id"}, inplace=True)
 
 progcarry_df["game_id"] = pd.to_numeric(progcarry_df["game_id"], errors="coerce").astype("Int64")
 
-# xT — loaded from pre-built parquet (produced by xT_brasileirao.py)
+# xT — loaded from pre-built parquet (produced by xT_brasileirao.py, plataforma-scouting models)
 xt_df = pd.read_parquet("xT_brasileirao_2025.parquet")
-xt_df.rename(columns={"teamId": "team_id", "id": "event_id", "xT": "xthreat"}, inplace=True)
+xt_df.rename(columns={"teamId": "team_id", "id": "event_id"}, inplace=True)
 
-# Merge continuous xT values into progcarry_df so all downstream variables
-# that reference progcarry_df["xthreat"] have the data available.
+# Merge xT into progcarry_df so all downstream variables have it:
+#   xthreat          action xT (completed pass / take-on / carry; failed pass / take-on = 0)
+#   xt_delta_cadeia  xT added over the team's previous completed action in the chain (missing = not scored)
+# Carry rows are the reference carries themselves (D1), so each one matches its own xT row.
+progcarry_df["is_carry"] = progcarry_df["type_id"].isin([1000, 2000])
 progcarry_df = progcarry_df.merge(
-    xt_df[["game_id", "team_id", "event_id", "xthreat"]],
-    on=["game_id", "team_id", "event_id"],
+    xt_df[["game_id", "team_id", "event_id", "is_carry", "xthreat", "xt_delta_cadeia"]],
+    on=["game_id", "team_id", "event_id", "is_carry"],
     how="left",
+    validate="many_to_one",
 )
+progcarry_df.drop(columns="is_carry", inplace=True)
 progcarry_df["xthreat"] = progcarry_df["xthreat"].fillna(0.0)
 if (progcarry_df["xthreat"] != 0).sum() == 0:
     raise RuntimeError("xT merge produced all-zero xthreat column — event_id key space drift between xt_df and progcarry_df")
+
+# Every reference carry now has its own xT row (D1): none may be left unscored.
+_carry_rows = progcarry_df["type_id"].isin(tc.CARRY_TYPES)
+if progcarry_df.loc[_carry_rows, "xt_delta_cadeia"].isna().all():
+    raise RuntimeError("no carry row matched an xT row — check the (game_id, team_id, event_id, is_carry) keys")
+
+# Shared event sets (docs/variable_consistency_decisions.md D3, D4) used by every variable below.
+play_df = tc.play_frame(progcarry_df)
+LOSS_ROWS = pd.Series(progcarry_df.index.isin(play_df.index[tc.loss_mask(play_df).to_numpy()]),
+                      index=progcarry_df.index)
+REGAIN_ROWS = pd.Series(progcarry_df.index.isin(play_df.index[tc.possession_won_mask(play_df).to_numpy()]),
+                        index=progcarry_df.index)
+GAME_TEAMS = progcarry_df[["game_id", "team_id"]].drop_duplicates()
 
 ############################################################################################
 ############################################################################################
@@ -438,14 +453,9 @@ progcarry_df["passes_into_third"] = (
 ###############################################################################
 ###############################################################################
 
-# Helper: check if a qualifier value exists in the list-of-dicts format
-# Qualifiers are stored as [{"type": {"displayName": ..., "value": N}, ...}, ...]
+# Helper: True if qualifier id `val` is on the event, whatever the storage (dict, list or ndarray of dicts) — B3.
 def has_qualifier(q, val):
-    if isinstance(q, list):
-        return any(item.get("type", {}).get("value") == val for item in q)
-    if isinstance(q, dict):
-        return val in q
-    return False
+    return val in tc.qualifier_ids(q)
 
 # Crosses (pass with qualifier 2)
 progcarry_df["cross"] = (
@@ -456,39 +466,11 @@ progcarry_df["cross"] = (
 ###############################################################################
 ###############################################################################
 
-# Progressive passes — use meter-scaled distance for consistent thresholds
-PITCH_LEN = 105.0  # meters (x-axis)
-PITCH_WID = 68.0   # meters (y-axis)
-
-progcarry_df["pass_length"] = np.sqrt(
-    ((progcarry_df["end_x"] - progcarry_df["start_x"]) * PITCH_LEN / 100)**2 +
-    ((progcarry_df["end_y"] - progcarry_df["start_y"]) * PITCH_WID / 100)**2
-)
-
-# Remaining distance to goal line in meters; clamp to avoid division by zero
-remaining_distance = ((100 - progcarry_df["start_x"]) * PITCH_LEN / 100).clip(lower=0.1)
-
-# Forward progression ratio
-progressive_condition = (
-    (progcarry_df["end_x"] - progcarry_df["start_x"]) * PITCH_LEN / 100
-) / remaining_distance
-
-# Progressive pass: type_id == 1 (pass), >= 10m length, >= 25% of remaining distance covered
-progcarry_df["progressive_pass"] = (
-    (progcarry_df["type_id"] == 1) &
-    (progcarry_df["pass_length"] >= 10) &
-    (progressive_condition >= 0.25)
-).astype(int)
-
-###############################################################################
-###############################################################################
-
-# Ball progression: progressive carry (type_id == 2000), same thresholds
-progcarry_df["ball_progression"] = (
-    (progcarry_df["type_id"] == 2000) &
-    (progcarry_df["pass_length"] >= 10) &
-    (progressive_condition >= 0.25)
-).astype(int)
+# Progressive pass / ball progression — reference `progressive()` (D1): length >= 10 Opta units and x gain >= 25%
+# of the distance left to the goal line. Ball progression = progressive carries (types 1000 and 2000).
+_is_progressive = tc.progressive(progcarry_df)
+progcarry_df["progressive_pass"] = ((progcarry_df["type_id"] == 1) & _is_progressive).astype(int)
+progcarry_df["ball_progression"] = (progcarry_df["type_id"].isin(tc.CARRY_TYPES) & _is_progressive).astype(int)
 
 ###############################################################################
 ###############################################################################
@@ -587,7 +569,7 @@ pressing intensity"""
 #
 # PPDA for team A in a given match =
 #     (opponent B's open-play passes in B's defensive 60% of the pitch)
-#   / (A's tackles + interceptions + fouls committed in that same physical area)
+#   / (A's tackles + interceptions + challenges + fouls committed in that same physical area) — D5
 #
 # Opta F24 coordinates are normalized so each team attacks from x=0 (own goal)
 # toward x=100 (opponent's goal). The "opponent's defensive 60%" is therefore:
@@ -679,10 +661,18 @@ fouls = (
     .reset_index(name="fouls")
 )
 
+challenges = (
+    df_press_zone[df_press_zone["type_id"] == 45]
+    .groupby(["game_id", "team_id"])
+    .size()
+    .reset_index(name="challenges")
+)
+
 defensive_actions = (
     tackles
     .merge(interceptions, on=["game_id", "team_id"], how="outer")
     .merge(fouls, on=["game_id", "team_id"], how="outer")
+    .merge(challenges, on=["game_id", "team_id"], how="outer")
     .fillna(0)
 )
 
@@ -690,6 +680,7 @@ defensive_actions["total_def_actions"] = (
     defensive_actions["tackles"]
     + defensive_actions["interceptions"]
     + defensive_actions["fouls"]
+    + defensive_actions["challenges"]
 )
 
 ppda_base = defensive_actions.merge(
@@ -742,24 +733,17 @@ variable_df["team_id"] = variable_df["team_id"].fillna(0)
 # 2
 # Defensive intensity
 """Defensive intensity is defined as the number of defensive duels, loose ball duels, interceptions,
-tackles, and fouls when out of possession, adjusted by the opponent's possession. It measures how
-actively a player or team engages in defensive actions relative to the amount of time the opponent
-has the ball."""
+tackles, ball recoveries and fouls committed when out of possession, per game (not adjusted for possession: the
+count barely moves with the opponent's possession). It measures how actively a team engages in defensive actions."""
 
 # Defensive Intensity (unadjusted)
 #
 # Per the definition: number of defensive duels, loose ball duels,
 # interceptions, tackles, and fouls committed while out of possession.
-# The possession adjustment (dividing by opponent possession) is applied
-# downstream in the master pipeline, so this module only produces the raw
-# counts per (game_id, team_id).
+# Raw counts per (game_id, team_id); no possession adjustment (see variable_df_new).
 #
 # Opta F24 mapping (from reference/Opta-f24_appendices.md):
-#   tackles          -> type_id 7   (all outcomes)
-#   interceptions    -> type_id 8
-#   defensive duels  -> type_id 45  (Challenge: defender fails to win ball)
-#   loose ball duels -> type_id 44  (Aerial 50/50)
-#   fouls committed  -> type_id 4 AND outcome = 0  (outcome 1 = fouled)
+# D5 / reference #35: tackles 7, interceptions 8, aerials 44, challenges 45, ball recoveries 49, fouls committed (4, outcome 0).
 #
 # Foul outcome convention in the WhoScored-derived JSON used here is the
 # OPPOSITE of the official Opta F24 spec (Appendix 8). Verified empirically
@@ -770,8 +754,9 @@ has the ball."""
 DEFENSIVE_TYPE_IDS = {
     "tackles": 7,
     "interceptions": 8,
-    "defensive_duels": 45,
-    "loose_ball_duels": 44,
+    "defensive_duels": 45,   # challenges (dribbled past)
+    "loose_ball_duels": 44,  # aerial duels
+    "ball_recoveries": 49,
 }
 
 def calculate_defensive_intensity(progcarry_df):
@@ -780,7 +765,6 @@ def calculate_defensive_intensity(progcarry_df):
 
     Returns a DataFrame with one row per team per game containing each
     individual action count and their sum as `defensive_intensity`.
-    The possession adjustment is applied later in the master pipeline.
     """
     df = progcarry_df[["game_id", "team_id", "type_id", "outcome"]]
 
@@ -822,8 +806,7 @@ def calculate_defensive_intensity(progcarry_df):
 variable_df2 = calculate_defensive_intensity(progcarry_df)
 variable_df2.head(100).to_csv("variable_df2.csv", index=True)
 
-# Merge raw defensive_intensity into variable_df. Possession adjustment is
-# handled downstream in the master pipeline.
+# Merge raw defensive_intensity into variable_df (no possession adjustment).
 variable_df = variable_df.merge(
     variable_df2[["game_id", "team_id", "defensive_intensity"]],
     on=["game_id", "team_id"],
@@ -846,164 +829,22 @@ one-on-one defensive challenges on the ground."""
 # stops progression or recovers possession — out of all defensive ground
 # duels contested.
 #
-# Opta F24 mapping (reference/Opta-f24_appendices.md, Appendix 1 line 49 for
-# Tackle outcome semantics; Appendix 1 line 45 for Take On's overrun caveat):
-#
-#   WON buckets
-#     - type_id 7  (Tackle)   any outcome    # defender dispossesses attacker
-#                                            #   (outcome 1 = won + retained,
-#                                            #    outcome 0 = won + ball lost
-#                                            #    to a third player / out of
-#                                            #    play — both stop the attack)
-#     - type_id 4  (Foul)     outcome == 0   # defender commits foul to stop
-#                                            #   (WhoScored convention: 0=committed)
-#     - type_id 54 (Smother)  outcome == 1   # GK wins the ball on the ground
-#     - type_id 3  (Take On)  outcome == 0   # attacker's failed dribble
-#                                            # -> credit the OPPONENT (defender)
-#
-#   LOST buckets
-#     - type_id 45 (Challenge) any outcome   # defender fails (always lost)
-#     - type_id 3  (Take On)   outcome == 1  # attacker beats defender
-#                                            # -> credit the OPPONENT (defender)
-#
-# Take-On filter:
-#   Type-3 events with qualifier 211 ("overrun") are excluded — per Appendix 1
-#   line 45 these are bad-touch overruns, not always a duel event.
-#
-# Foul outcome convention in the WhoScored-derived JSON used here is the
-# OPPOSITE of the official Opta F24 spec (Appendix 8). Verified empirically
-# against the next-FK-taker and post-foul card team:
-#     outcome == 0  -> player who COMMITTED the foul
-#     outcome == 1  -> player who WAS fouled
-# Only outcome == 0 fouls (defensive fouls by the defender) feed the WON bucket.
-#
-# Exclusions and their reasons:
-#   - type_id 8  (Interception) — reading a pass into space, not a 1v1 duel.
-#   - type_id 12 (Clearance)    — not a contest, just a release under pressure.
-#   - type_id 49 (Ball recovery)— a possession-change marker, not a duel.
-#   - type_id 50 (Dispossessed) — attacker-side counterpart of a successful
-#                                 tackle; already counted via type 7 and would
-#                                 double-book the loss to the wrong team.
-#
-# Fouls suffered (type 4, outcome == 1 in this dataset) are not a defender's
-# lost duel — they describe the attacker being fouled, so they are not counted.
-
-# Build team <-> opponent mapping per game so take-on events, which store
-# team_id as the attacker, can be reattributed to the defending team.
-_games_teams = progcarry_df[["game_id", "team_id"]].drop_duplicates()
-_game_teams_grouped = (
-    _games_teams.groupby("game_id")["team_id"].apply(list).reset_index()
-)
-
-def _get_opponent(game_id, team_id, game_teams_df):
-    teams = game_teams_df.loc[game_teams_df["game_id"] == game_id, "team_id"].iloc[0]
-    if len(teams) != 2:
-        return None
-    return teams[0] if teams[1] == team_id else teams[1]
-
-_mapping = []
-for _, row in _games_teams.iterrows():
-    opp = _get_opponent(row["game_id"], row["team_id"], _game_teams_grouped)
-    if opp is not None:
-        _mapping.append({
-            "game_id": row["game_id"],
-            "team_id": row["team_id"],
-            "opponent_team_id": opp,
-        })
-team_opponent_df = pd.DataFrame(_mapping)
-
-df = progcarry_df[["game_id", "team_id", "type_id", "outcome", "qualifiers"]].merge(
-    team_opponent_df,
-    on=["game_id", "team_id"],
-    how="left",
-)
-
-# --- Own-perspective events (team_id already = defender) ---
-own_won_mask = (
-    (df["type_id"] == 7)                                      # Tackle, any outcome
-    | ((df["type_id"] == 4)  & (df["outcome"] == 0))          # Foul committed
-    | ((df["type_id"] == 54) & (df["outcome"] == 1))          # Smother won
-)
-own_lost_mask = (df["type_id"] == 45)                         # Challenge (always lost)
-
-own_won = (
-    df[own_won_mask]
-    .groupby(["game_id", "team_id"])
-    .size()
-    .rename("own_won")
-)
-own_lost = (
-    df[own_lost_mask]
-    .groupby(["game_id", "team_id"])
-    .size()
-    .rename("own_lost")
-)
-
-# --- Take-on events (team_id = attacker, reattribute to defender) ---
-# Exclude overruns (qualifier 211) — per Appendix 1 line 45 they are bad-touch
-# events that are not always duels.
-_is_overrun = df["qualifiers"].apply(lambda q: has_qualifier(q, 211))
-takeon = df[
-    (df["type_id"] == 3)
-    & df["opponent_team_id"].notna()
-    & (~_is_overrun)
-].copy()
-takeon["defender_team_id"] = takeon["opponent_team_id"]
-
-takeon_won = (
-    takeon[takeon["outcome"] == 0]  # attacker failed -> defender won
-    .groupby(["game_id", "defender_team_id"])
-    .size()
-    .rename("takeon_won")
-    .rename_axis(index=["game_id", "team_id"])
-)
-takeon_lost = (
-    takeon[takeon["outcome"] == 1]  # attacker succeeded -> defender lost
-    .groupby(["game_id", "defender_team_id"])
-    .size()
-    .rename("takeon_lost")
-    .rename_axis(index=["game_id", "team_id"])
-)
-
+# Defensive ground duels (reference `ground_duels`, B2): won = tackle (7, any outcome), lost = dribbled past (45).
+# Opponent take-ons are NOT counted: each is the same duel logged from the other side (3,931/3,931 challenges
+# sit next to an opponent take-on), so counting them doubled every duel.
+_won, _lost = tc.ground_duels(progcarry_df)
 variable_df3 = (
-    pd.concat([own_won, own_lost, takeon_won, takeon_lost], axis=1)
-    .fillna(0)
-    .astype(int)
-    .reset_index()
+    progcarry_df.assign(won=_won, lost=_lost)
+    .groupby(["game_id", "team_id"], as_index=False)[["won", "lost"]].sum()
 )
-
-variable_df3["defensive_duels_won"] = (
-    variable_df3["own_won"] + variable_df3["takeon_won"]
-)
-variable_df3["defensive_duels_lost"] = (
-    variable_df3["own_lost"] + variable_df3["takeon_lost"]
-)
-
-_denom = (
-    variable_df3["defensive_duels_won"] + variable_df3["defensive_duels_lost"]
-)
-variable_df3["defensive_duels_won_%"] = np.where(
-    _denom > 0,
-    variable_df3["defensive_duels_won"] / _denom,
-    np.nan,
-)
-
-variable_df3 = variable_df3[[
-    "game_id",
-    "team_id",
-    "defensive_duels_won",
-    "defensive_duels_lost",
-    "defensive_duels_won_%",
-]]
+_contested = variable_df3["won"] + variable_df3["lost"]
+variable_df3["defensive_duels_won_%"] = np.where(_contested > 0, variable_df3["won"] / _contested, np.nan)
 variable_df3.head(100).to_csv("variable_df3.csv", index=True)
 
 variable_df = variable_df.merge(
     variable_df3[["game_id", "team_id", "defensive_duels_won_%"]],
     on=["game_id", "team_id"],
     how="left",
-)
-variable_df["defensive_duels_won_%"] = (
-    variable_df["defensive_duels_won_%"].fillna(0)
 )
 
 ###############################################################################
@@ -1026,46 +867,17 @@ team engages in defensive activities."""
 # therefore a percentage, not meters — it must be scaled by the physical
 # pitch length to produce meters.
 #
-# Defensive action set (per task definition):
-#   - type_id 4  (Foul)         outcome == 0  # foul committed by defender
-#                                             #   (WhoScored convention: 0=committed)
-#   - type_id 7  (Tackle)       any outcome
-#   - type_id 8  (Interception)
-#   - type_id 12 (Clearance)
-#   - type_id 44 (Aerial duel)
-#   - type_id 45 (Challenge)
-#   - type_id 49 (Ball recovery)
-#
-# Foul outcome convention in the WhoScored-derived JSON used here is the
-# OPPOSITE of the official Opta F24 spec (Appendix 8). Verified empirically
-# against the next-FK-taker and post-foul card team:
-#     outcome == 0  -> player who COMMITTED the foul
-#     outcome == 1  -> player who WAS fouled
-# Only outcome == 0 fouls (defensive fouls) feed the height calculation —
-# fouls received describe the team's attacking positions and would bias the
-# defensive line upward.
-#
-# Smother (type 54) is intentionally excluded: it always happens near the
-# defender's own goal and would skew height downward.
 
 PITCH_LENGTH_M = 105.0  # UEFA standard pitch length
 
-defensive_mask = (
-    ((progcarry_df["type_id"] == 4) & (progcarry_df["outcome"] == 0))
-    | progcarry_df["type_id"].isin([7, 8, 12, 44, 45, 49])
-)
-
+# D5 / reference area.py: tackles, interceptions, clearances, ball recoveries (7, 8, 12, 49) and fouls committed,
+# outside set-piece chains. Aerials (44) and challenges (45) are out: aerials are logged for the attacker too.
+_h4 = play_df[tc.height_mask(play_df) & ~tc.set_piece_chain_rows(play_df)]
 variable_df4 = (
-    progcarry_df[defensive_mask]
-    .groupby(["game_id", "team_id"], as_index=False)["start_x"]
-    .mean()
+    _h4.groupby(["game_id", "team_id"], as_index=False)["start_x"].mean()
     .rename(columns={"start_x": "defensive_height"})
 )
-
-# Convert the 0-100 pitch percentage to meters on a UEFA-standard pitch.
-variable_df4["defensive_height"] = (
-    variable_df4["defensive_height"] * PITCH_LENGTH_M / 100.0
-)
+variable_df4["defensive_height"] = variable_df4["defensive_height"] * PITCH_LENGTH_M / 100.0
 
 variable_df4.head(100).to_csv("variable_df4.csv", index=True)
 
@@ -1097,7 +909,7 @@ possession-based football.
 # playing against move the ball".
 #
 # Reads from progcarry_chains_df — the non-destructive valid-chain view built
-# by possession_chain_code.py (possessionId != 0). In that view:
+# by possession_chain.py (chain ids start at 1 (ref_pipeline.chains_table); the != 0 filter keeps every chain). In that view:
 #   - A chain's total duration in seconds is stored on its last_chain == 1
 #     row as `possession_time`.
 #   - A team's events during its own possession chains are the events in
@@ -1200,6 +1012,43 @@ variable_df = variable_df.merge(
 
 ###############################################################################
 ###############################################################################
+# Shared zone-reach tables (docs/variable_consistency_decisions.md D2). A chain reaches a zone when a chain-team
+# action is located there: its start, or the end of a completed pass or a carry (never a shot end or a failed-pass
+# end). Denominators are chains that start outside the zone.
+CHAINS = tc.chain_table(progcarry_df)
+
+# 10 s after each regain (D4): rows of the regaining team before its next loss (D3); regains outside the zone only.
+AFTER_REGAIN = tc.after_regain(progcarry_df, REGAIN_ROWS, LOSS_ROWS)
+_reg_rows = progcarry_df[REGAIN_ROWS]
+REGAINS = pd.DataFrame({
+    "reg_idx": _reg_rows.index, "game_id": _reg_rows["game_id"].to_numpy(), "team_id": _reg_rows["team_id"].to_numpy(),
+    "start_x": _reg_rows["start_x"].to_numpy(),
+    "in_third": tc.in_final_third(_reg_rows["start_x"]).to_numpy(),
+    "in_box": tc.in_box(_reg_rows["start_x"], _reg_rows["start_y"]).to_numpy(),
+}).set_index("reg_idx")
+for _zone in ("third", "box"):
+    REGAINS[f"reaches_{_zone}"] = (
+        tc.zone_hits(AFTER_REGAIN, _zone).groupby(AFTER_REGAIN["reg_idx"]).any()
+        .reindex(REGAINS.index, fill_value=False)
+    )
+_np = AFTER_REGAIN[tc.npxg_shots(AFTER_REGAIN)]
+REGAINS["xg"] = _np.groupby("reg_idx")["xG"].sum().reindex(REGAINS.index, fill_value=0.0)
+_xt_rows = AFTER_REGAIN[~AFTER_REGAIN[[f"q{q}" for q in tc.XT_SET_PIECE_QUALIFIERS]].any(axis=1)]
+REGAINS["xt"] = _xt_rows.groupby("reg_idx")["xt_delta_cadeia"].sum().reindex(REGAINS.index, fill_value=0.0)
+
+
+def _chain_pct(numerator_col, denominator_mask, name):
+    """% of the team's chains in `denominator_mask` that satisfy `numerator_col` (NaN when the denominator is 0)."""
+    sub = CHAINS[denominator_mask]
+    return sub.groupby(["game_id", "team_id"])[numerator_col].mean().mul(100.0).rename(name).reset_index()
+
+
+def _regain_count(mask_col, outside_col, name):
+    """Regains outside the zone whose next 10 s reach it, counted per team."""
+    sub = REGAINS[~REGAINS[outside_col]]
+    return sub.groupby(["game_id", "team_id"])[mask_col].sum().rename(name).reset_index()
+
+
 # Variáveis
 # 6
 #Opp. Possession to final third %
@@ -1209,108 +1058,9 @@ into the final third of the pitch. This metric helps in understanding how effect
 can penetrate the defensive setup and advance towards the goal.
 """
 
-# Opp. Possession to Final Third %
-#
-# Share of the OPPONENT's possessions that successfully advance into the
-# final third of the pitch. Computed per team first, then swapped so each
-# team's row carries the other team's share.
-#
-# Reads from progcarry_chains_df (the chain-tagged event view built by
-# possession_chain.py — chain numbering starts at 0 and chain 0 is a real
-# possession, not a sentinel).
-#
-# Final-third boundary: per Opta F24 Appendix 11 (reference/Opta-f24_
-# appendices.md line 950), start_x and end_x are 0-100 percentages and
-# every team attacks from x=0 toward x=100, so the attacking final third
-# is start_x >= 200/3 (~66.67).
-#
-# Reach test: a chain "reaches the final third" if ANY of its events has
-# start_x >= FT or end_x >= FT. This catches both pass-led entries (the
-# pass event itself crosses the line in start_x→end_x) and carry-led
-# entries (the carry happens between events, but the destination event's
-# start_x is then >= FT). possession_chain.py does not insert synthetic
-# carry rows, so a strict per-event "start_x < FT & end_x >= FT" test
-# under-counts carry-led entries.
-#
-# Denominator choice: a possession counts as "valid" only if its first
-# event starts OUTSIDE the final third. Possessions that already begin in
-# the final third can't progress INTO it, so they're excluded from both
-# numerator and denominator.
-
-FINAL_THIRD = 200.0 / 3.0  # ~66.67
-
-df = progcarry_chains_df[
-    ["game_id", "team_id", "possessionId", "start_x", "end_x"]
-].copy()
-
-# Per-event: does this event itself sit at or beyond the final-third line
-# (either at the start or at the end of the action)?
-df["reaches_final_third"] = (
-    (df["start_x"] >= FINAL_THIRD) | (df["end_x"] >= FINAL_THIRD)
-)
-
-# Collapse to one row per possession chain.
-possession_stats = (
-    df.groupby(["game_id", "team_id", "possessionId"], as_index=False)
-    .agg(
-        first_start_x=("start_x", "first"),
-        any_reach=("reaches_final_third", "any"),
-    )
-)
-
-# Keep only possessions that started outside the final third.
-valid_possessions = possession_stats.loc[
-    possession_stats["first_start_x"] < FINAL_THIRD
-]
-
-# Aggregate to team-game level.
-team_stats = (
-    valid_possessions.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        total_valid_possessions=("possessionId", "count"),
-        final_third_entries=("any_reach", "sum"),
-    )
-)
-team_stats["progression_percentage"] = np.where(
-    team_stats["total_valid_possessions"] > 0,
-    team_stats["final_third_entries"]
-    / team_stats["total_valid_possessions"]
-    * 100.0,
-    np.nan,
-)
-
-# Opposition swap: self-merge on game_id, exclude same-team rows, keep the
-# opponent's progression as opposition_progression_percentage.
-_team_for_swap = team_stats[["game_id", "team_id", "progression_percentage"]]
-_opposition = (
-    _team_for_swap.merge(
-        _team_for_swap.rename(
-            columns={
-                "team_id": "opponent_team_id",
-                "progression_percentage": "opposition_progression_percentage",
-            }
-        ),
-        on="game_id",
-    )
-    .query("team_id != opponent_team_id")
-    [["game_id", "team_id", "opposition_progression_percentage"]]
-)
-
-variable_df6 = team_stats.merge(
-    _opposition,
-    on=["game_id", "team_id"],
-    how="left",
-)[
-    [
-        "game_id",
-        "team_id",
-        "total_valid_possessions",
-        "final_third_entries",
-        "progression_percentage",
-        "opposition_progression_percentage",
-    ]
-]
-
+# Definition: shared zone / 10 s tables built before # 6 (docs/variable_consistency_decisions.md D2, D4).
+variable_df6 = tc.to_opponent(
+    _chain_pct("reaches_third", ~CHAINS["starts_in_third"], "opposition_progression_percentage"), GAME_TEAMS)
 variable_df6.head(100).to_csv("variable_df6.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -1333,95 +1083,10 @@ variable_df = variable_df.merge(
 third of the pitch into the opponent's penalty box. This metric helps in understanding how
 effectively the opposition can penetrate the defensive setup and create scoring opportunities."""
 
-# Opp. Final Third to Box %
-#
-# Percentage of possessions that successfully move from the final third
-# into the penalty box. Computed per team, then swapped so each team's
-# row carries the opponent's value.
-#
-# Reads from progcarry_chains_df (the chain-tagged event view built by
-# possession_chain.py — chain numbering starts at 0 and chain 0 is a real
-# possession, not a sentinel).
-#
-# Opta F24 coordinate reference (Appendix 11, line 957):
-#   Final third: x >= 66.67 (200/3)
-#   Penalty box: x >= 83, 21.1 <= y <= 78.9
-#
-# Reach tests use BOTH start and end coordinates:
-#   - in_box (per event): start in box OR end in box. Catches passes that
-#     end in the box even when no recipient event is recorded (e.g., the
-#     pass is intercepted at the box edge and the chain ends there).
-#   - in_ft (per event): start_x >= FT OR end_x >= FT. Catches carry-led
-#     entries (between events) and pass-led entries — possession_chain.py
-#     does not insert synthetic carry rows.
-#
-# Denominator filter:
-#   - has_ft (chain reached FT) AND
-#   - NOT first_in_box (chain didn't START already inside the box)
-# Excluding chains starting in the box guards against treating already-
-# in-box chains as "moves from FT into box".
-
-FINAL_THIRD = 200.0 / 3.0
-BOX_X = 83.0
-BOX_Y_MIN = 21.1
-BOX_Y_MAX = 78.9
-
-df7 = progcarry_chains_df[
-    ["game_id", "team_id", "possessionId", "start_x", "start_y", "end_x", "end_y"]
-].copy()
-
-# Per-event geometry flags.
-_start_in_box = (df7["start_x"] >= BOX_X) & df7["start_y"].between(BOX_Y_MIN, BOX_Y_MAX)
-_end_in_box = (df7["end_x"] >= BOX_X) & df7["end_y"].between(BOX_Y_MIN, BOX_Y_MAX)
-df7["start_in_box"] = _start_in_box
-df7["in_box"] = _start_in_box | _end_in_box
-df7["in_ft"] = (df7["start_x"] >= FINAL_THIRD) | (df7["end_x"] >= FINAL_THIRD)
-
-# Collapse to one row per possession chain.
-chain_stats = df7.groupby(["game_id", "team_id", "possessionId"], as_index=False).agg(
-    first_in_box=("start_in_box", "first"),
-    has_ft=("in_ft", "any"),
-    has_box=("in_box", "any"),
-)
-
-# Valid: chain reached the final third and didn't already start in the box.
-valid = chain_stats[chain_stats["has_ft"] & (~chain_stats["first_in_box"])]
-
-team_stats = valid.groupby(["game_id", "team_id"], as_index=False).agg(
-    final_third_possessions=("possessionId", "count"),
-    box_entries=("has_box", "sum"),
-)
-
-team_stats["progression_percentage"] = np.where(
-    team_stats["final_third_possessions"] > 0,
-    team_stats["box_entries"] / team_stats["final_third_possessions"] * 100.0,
-    np.nan,
-)
-
-_swap_cols = team_stats[["game_id", "team_id", "progression_percentage"]]
-_opposition = (
-    _swap_cols.merge(
-        _swap_cols.rename(columns={
-            "team_id": "opponent_team_id",
-            "progression_percentage": "opp_final_third_to_box_%",
-        }),
-        on="game_id",
-    )
-    .query("team_id != opponent_team_id")
-    [["game_id", "team_id", "opp_final_third_to_box_%"]]
-)
-
-variable_df7 = team_stats.merge(_opposition, on=["game_id", "team_id"], how="left")
-
-variable_df7 = variable_df7[[
-    "game_id",
-    "team_id",
-    "final_third_possessions",
-    "box_entries",
-    "progression_percentage",
-    "opp_final_third_to_box_%",
-]]
-
+# Definition: shared zone / 10 s tables built before # 6 (docs/variable_consistency_decisions.md D2, D4).
+variable_df7 = tc.to_opponent(
+    _chain_pct("reaches_box", CHAINS["reaches_third"] & ~CHAINS["starts_in_box"], "opp_final_third_to_box_%"),
+    GAME_TEAMS)
 variable_df7.head(100).to_csv("variable_df7.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -1444,93 +1109,13 @@ expected threat (xT) per 100 successful opponent passes originating from within 
 defensive area. This metric helps in understanding how much threat the opposition's passes from
 a player's defensive area contribute to potential scoring opportunities."""
 
-# Opp. xT — Opposition Expected Threat from defensive-area successful passes
-#
-# Accumulated action-based xT from the OPPONENT's successful passes that
-# originate in the team's defensive area. A downstream step normalizes this
-# per 100 opponent passes; this file outputs the raw accumulated xT (and the
-# pass count, in case the downstream normalizer wants it from here).
-#
-# Filters applied, per the metric definition:
-#   1. type_id == 1     Pass only. Opta F24 event type 1 = Pass
-#                       (reference/Opta-f24_appendices.md line 43).
-#   2. outcome          Successful passes only.
-#   3. start_x >= 200/3 Pass originates in the event team's attacking
-#                       third (~66.67). Opta F24 Appendix 11 (line 950)
-#                       normalizes every event L->R in the event team's
-#                       attacking direction, so the OPPONENT's attacking
-#                       third is geometrically the team's defensive area.
-#   4. NOT a set piece  Exclude corners (qualifier 6) and throw-ins
-#                       (107). These are restart-context deliveries
-#                       that the underlying xT model can rate as high-
-#                       threat purely on coordinates (e.g. corner into
-#                       the box) and would inflate the conceded xT for
-#                       teams that simply face many corners. Free kicks
-#                       (5) and goal kicks (124) are KEPT because their
-#                       threat values reflect real in-play decision-
-#                       making. This policy is mirrored in xT.py so
-#                       own-team and conceded xT use the same
-#                       convention.
-#
-# `xthreat` carries the continuous action-based xT value: orchestrator
-# lines 388-401 merge xT_brasileirao_2026.parquet onto progcarry_df and
-# raise if the merge produces an all-zero column.
-
-DEFENSIVE_AREA_THRESHOLD = 200.0 / 3.0  # ~66.67
-SET_PIECE_QUALIFIERS = (6, 107)
-
-_is_set_piece_pass = progcarry_df["qualifiers"].apply(
-    lambda q: any(has_qualifier(q, qid) for qid in SET_PIECE_QUALIFIERS)
-)
-
-_passes = progcarry_df.loc[
-    (progcarry_df["type_id"] == 1)
-    & (progcarry_df["outcome"] == 1)
-    & (progcarry_df["start_x"] >= DEFENSIVE_AREA_THRESHOLD)
-    & (~_is_set_piece_pass),
-    ["game_id", "team_id", "xthreat"],
-]
-
-team_stats = (
-    _passes.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        defensive_area_pass_xt=("xthreat", "sum"),
-        defensive_area_pass_count=("xthreat", "size"),
-    )
-)
-
-# Opposition swap: self-merge on game_id, exclude same-team rows, keep the
-# opponent's accumulated xT as Opposition_xT.
-_opposition = (
-    team_stats.merge(
-        team_stats.rename(
-            columns={
-                "team_id": "opponent_team_id",
-                "defensive_area_pass_xt": "Opposition_xT",
-                "defensive_area_pass_count": "opposition_defensive_area_pass_count",
-            }
-        ),
-        on="game_id",
-    )
-    .query("team_id != opponent_team_id")
-    [["game_id", "team_id", "Opposition_xT", "opposition_defensive_area_pass_count"]]
-)
-
-variable_df8 = team_stats.merge(
-    _opposition,
-    on=["game_id", "team_id"],
-    how="left",
-)[
-    [
-        "game_id",
-        "team_id",
-        "defensive_area_pass_xt",
-        "defensive_area_pass_count",
-        "Opposition_xT",
-        "opposition_defensive_area_pass_count",
-    ]
-]
-
+# Opponent xT per 100 of their completed passes starting in our defensive third (their final third), set pieces
+# (q6/q107/q124) excluded (B4; reference #55 uses the absolute xthreat for opposition metrics).
+_p8 = progcarry_df[tc.completed_pass(progcarry_df) & tc.in_final_third(progcarry_df["start_x"])
+                   & ~progcarry_df[[f"q{q}" for q in tc.XT_SET_PIECE_QUALIFIERS]].any(axis=1)]
+_x8 = _p8.groupby(["game_id", "team_id"]).agg(xt=("xthreat", "sum"), n=("xthreat", "size")).reset_index()
+_x8["Opposition_xT"] = np.where(_x8["n"] > 0, _x8["xt"] / _x8["n"] * 100.0, np.nan)
+variable_df8 = tc.to_opponent(_x8[["game_id", "team_id", "Opposition_xT"]], GAME_TEAMS)
 variable_df8.head(100).to_csv("variable_df8.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -1553,83 +1138,13 @@ occur in a team's own 40% of the pitch and are adjusted by possession. High turn
 how frequently a team loses possession in dangerous areas, potentially leading to scoring
 opportunities for the opposition."""
 
-# High Turnovers
-#
-# Count of possession-losing events that occur in the team's own 40% of
-# the pitch. Downstream code adjusts this by possession share.
-#
-# Own-40% filter: per Opta F24 Appendix 11 (reference/Opta-f24_appendices.md
-# line 950), every event is normalized L->R in the event team's attacking
-# direction, so the team's own goal is at x=0. "Own 40%" therefore means
-# start_x <= 40.
-#
-# Event-type selection, per the metric definition ("possessions lost due to
-# failed passes, bad ball touches, or lost attacking duels"):
-#
-#   type_id 1   Pass,         outcome=False -> failed pass (open-play only;
-#                                              set-piece passes excluded —
-#                                              see set-piece note below)
-#   type_id 3   Take On,      outcome=False -> failed dribble attempt
-#   type_id 50  Dispossessed                -> player tackled off the ball
-#                                              (Opta outcome always 1)
-#   type_id 51  Error                       -> mistake losing the ball
-#                                              (Opta outcome always 1)
-#   type_id 61  Ball touch                  -> bad touch / ball hit player;
-#                                              both outcomes lose the ball
-#                                              (ref line 830)
-#
-# Intentionally NOT counted:
-#   - type_id 44 (Aerial): a 50/50 ball in the air is not a "lost attacking
-#     duel" in the possession sense; counting every lost header in the own
-#     40% would over-count defensive clearances.
-#   - type_id 45 (Challenge): by Opta's definition (ref line 101) this is a
-#     defender failing to win the ball as an opponent dribbles past — the
-#     challenging team never had possession, so it is not a turnover.
-#
-# Set-piece exclusion on failed passes: a failed throw-in, corner, free
-# kick, or goal kick in the own 40% is a routine restart, not the open-play
-# turnover the downstream pressing/quality score is meant to capture.
-# Qualifier IDs match the convention used across the rest of the defensive
-# metric suite: 5 (free kick), 6 (corner), 107 (throw-in), 124 (goal kick).
-#
-# Note on chain length: the original code gated on `last_chain == 1`, which
-# `possession_chain_code.py` only sets on chains of >= 2 events. That
-# silently dropped isolated single-event turnovers, i.e. exactly the fast
-# losses this metric is meant to capture. The event-type filter already
-# carries the "possession lost" semantics, so the chain guard is removed.
-#
-# NaN preservation: the post-merge `fillna(0)` is intentionally NOT applied.
-# Missing-team rows must propagate as NaN through the downstream Z-score
-# step (a 0 there would be a real, extreme value and skew the Z).
-
-OWN_FORTY_THRESHOLD = 40.0
-SET_PIECE_QUALIFIERS = (5, 6, 107, 124)
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-_is_set_piece_pass = progcarry_df["qualifiers"].apply(
-    lambda q: any(has_qualifier(q, qid) for qid in SET_PIECE_QUALIFIERS)
-)
-
-_turnover_events = (
-    ((_type_id == 1) & ~_outcome & ~_is_set_piece_pass)
-    | ((_type_id == 3) & ~_outcome)
-    | (_type_id == 50)
-    | (_type_id == 51)
-    | (_type_id == 61)
-)
-
-filtered_df9 = progcarry_df.loc[
-    _turnover_events & (progcarry_df["start_x"] <= OWN_FORTY_THRESHOLD),
-    ["game_id", "team_id"],
-]
-
+# Turnovers in own defensive 40% (D3): reference losses — (1,0) (3,0) (50,1) (51,1) (61,0), last own event of the
+# chain, next event by the opponent — with start_x <= 40. Column name kept for the app ("Perdas de posse na linha baixa").
+_losses = progcarry_df[LOSS_ROWS]
 variable_df9 = (
-    filtered_df9.groupby(["game_id", "team_id"], as_index=False)
-    .size()
-    .rename(columns={"size": "high_turnovers"})
+    _losses[_losses["start_x"] <= tc.LOW_BLOCK_X]
+    .groupby(["game_id", "team_id"]).size().rename("high_turnovers").reset_index()
 )
-
 variable_df9.head(100).to_csv("variable_df9.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -1648,89 +1163,11 @@ variable_df = variable_df.merge(
 (possessions lost) occur. This metric helps in understanding at what point on the pitch a team is
 losing possession."""
 
-# Turnover Line Height (m)
-#
-# Average pitch height at which a team loses possession, expressed in
-# meters from that team's own goal line. Downstream code uses this to
-# characterize how high up the pitch each team gives the ball away.
-#
-# Coordinate & unit note: per Opta F24 Appendix 11 (reference/Opta-f24_
-# appendices.md line 950), start_x is a 0-100 percentage normalized L->R
-# in the event team's attacking direction. To report meters we scale by
-# the UEFA-standard pitch length (105 m), matching possession_chain_code.py
-# (PITCH_LENGTH_M = 105.0).
-#
-# Event-type selection matches variable_df9_code.py ("possessions lost due
-# to failed passes, bad ball touches, or lost attacking duels"):
-#
-#   type_id 1   Pass,         outcome=False -> failed pass (open-play only;
-#                                              set-piece passes excluded —
-#                                              see set-piece note below)
-#   type_id 3   Take On,      outcome=False -> failed dribble attempt
-#   type_id 50  Dispossessed                -> player tackled off the ball
-#   type_id 51  Error                       -> mistake losing the ball
-#   type_id 61  Ball touch                  -> bad touch / ball hit player
-#
-# Intentionally NOT counted (same reasoning as variable_df9_code.py):
-#   - type_id 44 (Aerial): 50/50 air ball, not a possession loss.
-#   - type_id 45 (Challenge): defender fails to dispossess a dribbler;
-#     the challenging team never had the ball.
-#
-# Set-piece exclusion on failed passes: set-piece restart locations are
-# stereotyped — failed goal kicks sit at start_x ~ 0, failed corners at
-# start_x ~ 100, throw-ins on the sideline, free kicks at the foul site.
-# Including them turns the average into a function of how many goal kicks
-# vs corners a team takes, not the open-play "where do we lose the ball"
-# picture this metric is meant to capture. Qualifier IDs match the rest
-# of the defensive metric suite: 5 (free kick), 6 (corner), 107 (throw-in),
-# 124 (goal kick).
-#
-# Location: start_x is used (not end_x) so the turnover is located at the
-# point it originated from. This is consistent with variable_df9_code.py,
-# which measures "own 40%" as start_x <= 40.
-#
-# Chain guard: the original code filtered on `last_chain == 1`, which
-# `possession_chain_code.py` only sets on chains of >= 2 events. That
-# silently dropped isolated single-event turnovers -- exactly the quick
-# losses this metric is meant to characterize -- so the guard is removed.
-# The event-type filter alone carries the "possession lost" semantics.
-#
-# NaN handling: if a team had no qualifying turnovers in a game, the
-# merged column is left as NaN rather than filled with 0. A value of 0 m
-# would place the turnover line on the team's own goal line and bias any
-# downstream averaging. Downstream code should treat NaN explicitly.
-
-PITCH_LENGTH_M = 105.0
-SET_PIECE_QUALIFIERS = (5, 6, 107, 124)
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-_is_set_piece_pass = progcarry_df["qualifiers"].apply(
-    lambda q: any(has_qualifier(q, qid) for qid in SET_PIECE_QUALIFIERS)
-)
-
-_turnover_events = (
-    ((_type_id == 1) & ~_outcome & ~_is_set_piece_pass)
-    | ((_type_id == 3) & ~_outcome)
-    | (_type_id == 50)
-    | (_type_id == 51)
-    | (_type_id == 61)
-)
-
-turnovers = progcarry_df.loc[
-    _turnover_events,
-    ["game_id", "team_id", "start_x"],
-]
-
+# Mean height of the reference losses (D3), metres.
 variable_df10 = (
-    turnovers.groupby(["game_id", "team_id"], as_index=False)["start_x"]
-    .mean()
-    .rename(columns={"start_x": "turnover_line_height"})
+    progcarry_df[LOSS_ROWS].groupby(["game_id", "team_id"])["start_x"].mean()
+    .mul(tc.X_METRES).rename("turnover_line_height").reset_index()
 )
-variable_df10["turnover_line_height"] = (
-    variable_df10["turnover_line_height"] * PITCH_LENGTH_M / 100.0
-)
-
 variable_df10.head(100).to_csv("variable_df10.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -1747,131 +1184,14 @@ variable_df = variable_df.merge(
 """Recoveries within 5s % refers to the percentage of ball recoveries that occur within 5 seconds of
 losing possession. This metric highlights a team's or player's ability to quickly regain control of
 the ball after losing it, often through effective pressing and counterpressing strategies."""
-# Recoveries Within 5s %
-#
-# Percentage of a team's ball recoveries that happen within 5 seconds of
-# that team losing the ball. Captures pressing / counter-pressing speed.
-#
-# Loss events (matches variable_df9_code.py):
-#   type_id 1   Pass,         outcome=False -> failed pass
-#   type_id 3   Take On,      outcome=False -> failed dribble attempt
-#   type_id 50  Dispossessed                -> player tackled off the ball
-#   type_id 51  Error                       -> mistake losing the ball
-#   type_id 61  Ball touch                  -> bad touch / ball hit player
-#
-# Recovery events (Opta "team wins the ball" categories that are present
-# in progcarry_df):
-#   type_id 49  Ball recovery            (Opta outcome always 1, ref line 818)
-#   type_id 8   Interception             (Opta outcome always 1, ref line 772
-#                                         of Opta-f24_appendices.md; verified
-#                                         empirically on 1955764.json: 21/21
-#                                         type-8 events with outcome=1)
-#   type_id 7   Tackle,     outcome=True (successful tackle wins possession)
-#   type_id 44  Aerial,     outcome=True (wins the aerial duel)
-#   type_id 11  Claim,      outcome=True (GK cleanly catches the cross)
-#
-# Intentionally NOT counted as recoveries:
-#   - type_id 3  Take On:   player already has the ball; not a recovery.
-#   - type_id 4  Foul:      free kick to fouled player, not a "ball win".
-#   - type_id 45 Challenge: defender FAILS to win the ball (outcome always 0
-#                           per ref line 816) -- the opposite of a recovery.
-#   - type_id 54 Smother:   not present in progcarry_df (upstream filter).
-#   - type_id 55 Offside provoked: possession awarded, not a ball win.
-#
-# Pairing: pd.merge_asof(..., direction="backward", by=[game_id, team_id,
-# period_id]) finds, for each recovery, the most recent same-team loss
-# with loss_time <= recovery_time inside the same period. Recoveries whose
-# prior loss falls within 5s are counted in the numerator; all recoveries
-# are in the denominator. Each recovery is paired at most once, so no
-# double-counting. Grouping by period_id prevents a loss at the end of H1
-# from pairing with a recovery at the start of H2, since `time` is per-
-# period seconds per possession_chain_code.py.
-#
-# Chain guard: the original code gated on last_chain == 1 / first_chain == 1
-# which possession_chain_code.py only sets on chains of >= 2 events,
-# silently dropping exactly the fast press-recover cycles this metric is
-# meant to measure. The event-type filter alone carries the semantics, so
-# the chain guard is removed.
-#
-# NaN: teams with zero recoveries leave the merged column as NaN rather
-# than being filled with 0, so "no data" stays distinct from "0%".
 
-WINDOW_SECONDS = 5.0
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_loss_mask = (
-    ((_type_id == 1) & ~_outcome)
-    | ((_type_id == 3) & ~_outcome)
-    | (_type_id == 50)
-    | (_type_id == 51)
-    | (_type_id == 61)
-)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | ((_type_id == 8))
-    | ((_type_id == 44) & _outcome)
-    | ((_type_id == 11) & _outcome)
-)
-
-_losses = (
-    progcarry_df.loc[_loss_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "loss_time"})
-    .sort_values("loss_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_recoveries = (
-    progcarry_df.loc[_recovery_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# For each recovery, find the most recent prior same-team loss in the same
-# (game, period).
-_paired = pd.merge_asof(
-    _recoveries,
-    _losses,
-    left_on="recovery_time",
-    right_on="loss_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="backward",
-)
-
-_paired["within_window"] = (
-    _paired["loss_time"].notna()
-    & ((_paired["recovery_time"] - _paired["loss_time"]) <= WINDOW_SECONDS)
-)
-
+# Counter-press success (D6, reference `counterpressing`): share of the team's losses won back within 5 s, each loss
+# counted once. Column name kept for the app ("Recuperações de posse em 5s (%)").
+_cp = tc.counterpress(play_df)
 variable_df11 = (
-    _paired.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        total_recoveries=("recovery_time", "size"),
-        recoveries_within_5s=("within_window", "sum"),
-    )
+    _cp.groupby(["game_id", "team_id"])["regained"].mean().mul(100.0)
+    .rename("recoveries_within_5s_%").reset_index()
 )
-variable_df11["recoveries_within_5s_%"] = np.where(
-    variable_df11["total_recoveries"] > 0,
-    variable_df11["recoveries_within_5s"]
-    / variable_df11["total_recoveries"]
-    * 100.0,
-    np.nan,
-)
-
-variable_df11 = variable_df11[
-    [
-        "game_id",
-        "team_id",
-        "total_recoveries",
-        "recoveries_within_5s",
-        "recoveries_within_5s_%",
-    ]
-]
-
 variable_df11.head(100).to_csv("variable_df11.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -1889,117 +1209,12 @@ variable_df = variable_df.merge(
 such as a tackle, interception, or clearance, after losing possession. This metric helps in understanding the
 responsiveness and reaction time of a player or team in defensive situations."""
 
-# Time to Defensive Action (s)
-#
-# Average seconds between a team losing the ball and that same team's
-# next defensive action, per team per game. Captures how quickly a side
-# reacts once dispossessed.
-#
-# Loss events (same set as variable_df9_code.py):
-#   type_id 1   Pass,         outcome=False -> failed pass
-#   type_id 3   Take On,      outcome=False -> failed dribble attempt
-#   type_id 50  Dispossessed                -> player tackled off the ball
-#   type_id 51  Error                       -> mistake losing the ball
-#   type_id 61  Ball touch                  -> bad touch / ball hit player
-#
-# Defensive-action events (the metric's examples are tackle, interception,
-# and clearance; the metric measures reactivity, so attempts count too):
-#   type_id 7   Tackle              -> tackle, both outcomes (attempt counts)
-#   type_id 8   Interception        -> Opta outcome always 1 (ref line 772)
-#   type_id 12  Clearance           -> both outcomes valid (ref line 776)
-#   type_id 44  Aerial              -> aerial duel, both outcomes (attempt
-#                                      counts; each duel produces two type-44
-#                                      rows, one per player)
-#   type_id 45  Challenge           -> defender attempts to win the ball and
-#                                      fails (Opta outcome always 0). Counted
-#                                      because the metric measures speed of
-#                                      defensive engagement, not success.
-#   type_id 49  Ball recovery       -> Opta "team wins the ball" event
-#   type_id 4   Foul, outcome == 0  -> committed foul (defensive disruption,
-#                                      e.g. tactical foul). NOTE: WhoScored
-#                                      JSON inverts the F24 foul outcome —
-#                                      outcome == 0 means the foul was
-#                                      COMMITTED (verified empirically on
-#                                      1955764.json via next-FK trace and
-#                                      post-foul card test).
-#
-# Pairing: pd.merge_asof(direction="forward", by=[game_id, team_id,
-# period_id]) finds, for each loss, the immediately-next same-team
-# defensive action in the same period. Each loss is paired at most once,
-# so there is no cross-product inflation. Grouping by period_id prevents
-# a loss at the end of H1 from pairing with an event at the start of H2
-# (time is per-period seconds in progcarry_df).
-#
-# Chain guard: the original code used `last_chain == 1` as the loss marker,
-# which possession_chain_code.py only sets on chains of >= 2 events and
-# thus silently dropped isolated quick losses. Using the event-type loss
-# mask directly removes that bias, matching variable_df9_code.py.
-#
-# NaN: teams with no qualifying losses or no subsequent defensive actions
-# leave the merged column as NaN. Filling with 0 would read as "reacted
-# instantly," indistinguishable from "no data", and would bias downstream
-# averaging.
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_loss_mask = (
-    ((_type_id == 1) & ~_outcome)
-    | ((_type_id == 3) & ~_outcome)
-    | (_type_id == 50)
-    | (_type_id == 51)
-    | (_type_id == 61)
-)
-
-_defensive_mask = (
-    (_type_id == 7)
-    | (_type_id == 8)
-    | (_type_id == 12)
-    | (_type_id == 44)
-    | (_type_id == 45)
-    | (_type_id == 49)
-    | ((_type_id == 4) & ~_outcome)
-)
-
-_losses = (
-    progcarry_df.loc[_loss_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "loss_time"})
-    .sort_values("loss_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_defensive_actions = (
-    progcarry_df.loc[_defensive_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "defensive_time"})
-    .sort_values("defensive_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# For each loss, find the next same-team defensive action in the same
-# (game, period). `allow_exact_matches=False` ensures defensive_time is
-# strictly greater than loss_time (two events can legitimately share a
-# `time` value since it is integer seconds).
-_paired = pd.merge_asof(
-    _losses,
-    _defensive_actions,
-    left_on="loss_time",
-    right_on="defensive_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=False,
-)
-
-_paired = _paired.loc[_paired["defensive_time"].notna()].copy()
-_paired["time_to_defensive_action"] = (
-    _paired["defensive_time"] - _paired["loss_time"]
-)
-
+# Seconds from each loss (D3) to the same team's next defensive action (D5 intensity set), same game and period.
+_t12 = tc.next_event(play_df, tc.loss_mask(play_df), tc.intensity_mask(play_df))
 variable_df12 = (
-    _paired.groupby(["game_id", "team_id"], as_index=False)["time_to_defensive_action"]
-    .mean()
-    .rename(columns={"time_to_defensive_action": "avg_time_to_defensive_action"})
+    _t12.groupby(["game_id", "team_id"])["seconds"].mean()
+    .rename("avg_time_to_defensive_action").reset_index()
 )
-
 variable_df12.head(100).to_csv("variable_df12.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -2017,113 +1232,12 @@ variable_df = variable_df.merge(
 the ball after losing it. This metric helps in understanding the efficiency and speed of a 
 team's ability to regain control of the ball"""
 
-# Time to Recovery (s)
-#
-# Average seconds between a team losing the ball and that same team
-# winning it back, per team per game. Captures how quickly a side
-# regains possession after giving it away.
-#
-# Loss events (same set as variable_df9_code.py):
-#   type_id 1   Pass,         outcome=False -> failed pass
-#   type_id 3   Take On,      outcome=False -> failed dribble attempt
-#   type_id 50  Dispossessed                -> player tackled off the ball
-#   type_id 51  Error                       -> mistake losing the ball
-#   type_id 61  Ball touch                  -> bad touch / ball hit player
-#
-# Recovery events (same set as variable_df11_code.py):
-#   type_id 49  Ball recovery            (Opta outcome always 1, ref line 818)
-#   type_id 8   Interception             (Opta outcome always 1, ref line 772
-#                                         of Opta-f24_appendices.md; verified
-#                                         empirically on 1955764.json: 21/21
-#                                         type-8 events with outcome=1)
-#   type_id 7   Tackle,     outcome=True (successful tackle wins possession)
-#   type_id 44  Aerial,     outcome=True (wins the aerial duel)
-#   type_id 11  Claim,      outcome=True (GK cleanly catches the cross)
-#
-# This mirrors variable_df11_code.py's loss / recovery definitions so
-# the two metrics stay consistent: df11 is the within-5s share of the
-# same distribution this file averages.
-#
-# Pairing: pd.merge_asof(direction="forward", by=[game_id, team_id,
-# period_id]) finds, for each loss, the immediately-next same-team
-# recovery in the same period. Each loss is paired at most once, so
-# there is no cross-product inflation. `allow_exact_matches=False`
-# enforces strictly recovery_time > loss_time (time is integer seconds
-# in progcarry_df, so same-second ties are possible). Grouping by
-# period_id prevents a loss at the end of H1 from pairing with a
-# recovery at the start of H2, since `time` is per-period seconds.
-#
-# Chain guard: the original code gated on last_chain == 1 / first_chain
-# == 1, which possession_chain_code.py only sets on chains of >= 2
-# events. That silently dropped isolated quick losses and isolated
-# short recoveries -- exactly the fast transitions this metric targets.
-# Using the event-type masks directly removes that bias.
-#
-# "last_chain as loss" framing: the original also treated any chain-end
-# as a loss, which included end-of-period / end-of-game / post-shot
-# chain ends and inflated the mean. Restricting to actual possession-
-# losing event types matches the metric's "after losing it" wording.
-#
-# NaN: losses with no subsequent recovery in the same period are
-# excluded from the per-game mean (merge_asof returns NaN, then the
-# groupby mean skips it). Teams with zero usable loss->recovery pairs
-# leave the merged column as NaN rather than being filled with 0, so
-# "no data" stays distinct from "recovered instantly."
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_loss_mask = (
-    ((_type_id == 1) & ~_outcome)
-    | ((_type_id == 3) & ~_outcome)
-    | (_type_id == 50)
-    | (_type_id == 51)
-    | (_type_id == 61)
-)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | ((_type_id == 8))
-    | ((_type_id == 44) & _outcome)
-    | ((_type_id == 11) & _outcome)
-)
-
-_losses = (
-    progcarry_df.loc[_loss_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "loss_time"})
-    .sort_values("loss_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_recoveries = (
-    progcarry_df.loc[_recovery_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# For each loss, find the next same-team recovery in the same
-# (game, period). allow_exact_matches=False -> recovery_time strictly > loss_time.
-_paired = pd.merge_asof(
-    _losses,
-    _recoveries,
-    left_on="loss_time",
-    right_on="recovery_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=False,
-)
-
-_paired = _paired.loc[_paired["recovery_time"].notna()].copy()
-_paired["time_to_recovery"] = _paired["recovery_time"] - _paired["loss_time"]
-
+# Seconds from each loss (D3) to the same team's next regain (D4), same game and period.
+_t13 = tc.next_event(play_df, tc.loss_mask(play_df), tc.possession_won_mask(play_df))
 variable_df13 = (
-    _paired.groupby(["game_id", "team_id"], as_index=False)["time_to_recovery"]
-    .mean()
-    .rename(columns={"time_to_recovery": "avg_recovery_time"})
+    _t13.groupby(["game_id", "team_id"])["seconds"].mean()
+    .rename("avg_recovery_time").reset_index()
 )
-
 variable_df13.head(100).to_csv("variable_df13.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -2142,147 +1256,8 @@ successfully enters the final third of the pitch within 10 seconds after recover
 metric helps in understanding how quickly and effectively the opposition can transition from defense 
 to attack and create potential scoring opportunities."""
 
-# Opp. Final Third Entries Within 10s After Recovery
-#
-# For each team T, the number of the OPPONENT's recoveries that are
-# followed by a final-third event within 10 seconds. Captures how often
-# the opposition converts a regained ball into a fast transition.
-#
-# Recovery events (same set as variable_df11_code.py):
-#   type_id 49  Ball recovery            (Opta outcome always 1, ref line 818)
-#   type_id 8   Interception             (Opta outcome always 1, ref line 772
-#                                         of Opta-f24_appendices.md; verified
-#                                         empirically on 1955764.json: 21/21
-#                                         type-8 events with outcome=1)
-#   type_id 7   Tackle,     outcome=True
-#   type_id 44  Aerial,     outcome=True
-#   type_id 11  Claim,      outcome=True
-#
-#
-# Final-third entry event: any event with end_x >= 200/3 (~66.67). Opta
-# F24 Appendix 11 (reference/Opta-f24_appendices.md line 950) normalizes
-# every event L->R in the event team's attacking direction, so end_x >=
-# 2/3 is always the event team's attacking third. The original code's
-# two disjunctions ("crossed into" | "already in") simplify to the single
-# `end_x >= 66.67` condition.
-#
-# Recovery inside the final third: if the recovery event itself ends in
-# the final third (a high press won deep), it self-pairs at delta=0 and
-# counts as a successful fast transition. merge_asof with direction=
-# "forward" and allow_exact_matches=True gives that behavior for free.
-#
-# Pairing: pd.merge_asof(recoveries, entry_events, direction="forward",
-# by=[game_id, team_id, period_id]) finds, for each recovery, the
-# earliest same-team event at or after recovery_time whose end_x lands
-# in the final third. If the gap is <= 10s the recovery is counted.
-# Replaces the original O(recoveries * frame_size) nested iterrows loop
-# with an O(n log n) vectorized pairing. Grouping by period_id prevents
-# a recovery at the end of H1 from being paired with an event at the
-# start of H2 (time is per-period seconds in progcarry_df).
-#
-# Short-chain bias: the original gated recoveries on `first_chain == 1`,
-# which possession_chain_code.py only sets on chains of >= 2 events, so
-# single-event possessions were silently dropped. The event-type mask
-# alone carries the "team won the ball" semantics and does not need the
-# chain guard.
-#
-# Opposition swap: for team T in game G, variable_df14 carries the
-# other team's count in `opposition_final_third_entries_10s`. Same
-# self-merge pattern as variable_df6_code.py.
-#
-# NaN preservation: the post-merge `fillna(0)` is intentionally NOT
-# applied. The Z-score pipeline can't distinguish "opponent had 0 fast
-# transitions" (a legitimate league extreme) from "team was missing
-# entirely from progcarry_df" — a 0 in the second case sits at the
-# league mean and biases the Z. Same reasoning as the rest of the
-# defensive-metric suite (e.g. perdas_posse_linha_baixa.py).
-
-FINAL_THIRD = 200.0 / 3.0
-WINDOW_SECONDS = 10.0
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | ((_type_id == 8))
-    | ((_type_id == 44) & _outcome)
-    | ((_type_id == 11) & _outcome)
-)
-
-_recoveries = (
-    progcarry_df.loc[_recovery_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_entry_events = (
-    progcarry_df.loc[
-        progcarry_df["end_x"] >= FINAL_THIRD,
-        ["game_id", "team_id", "period_id", "time"],
-    ]
-    .rename(columns={"time": "entry_time"})
-    .sort_values("entry_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# For each recovery, find the earliest same-team final-third event at or
-# after the recovery. allow_exact_matches=True lets a recovery whose own
-# event is in the final third self-pair at delta=0.
-_paired = pd.merge_asof(
-    _recoveries,
-    _entry_events,
-    left_on="recovery_time",
-    right_on="entry_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=True,
-)
-
-_paired["within_window"] = (
-    _paired["entry_time"].notna()
-    & ((_paired["entry_time"] - _paired["recovery_time"]) <= WINDOW_SECONDS)
-)
-
-_team_stats = (
-    _paired.groupby(["game_id", "team_id"], as_index=False)["within_window"]
-    .sum()
-    .rename(columns={"within_window": "final_third_entries_10s"})
-)
-_team_stats["final_third_entries_10s"] = (
-    _team_stats["final_third_entries_10s"].astype(int)
-)
-
-# Opposition swap: attach each team's count to the OTHER team's row.
-_opposition = (
-    _team_stats.merge(
-        _team_stats.rename(
-            columns={
-                "team_id": "opponent_team_id",
-                "final_third_entries_10s": "opposition_final_third_entries_10s",
-            }
-        ),
-        on="game_id",
-    )
-    .query("team_id != opponent_team_id")
-    [["game_id", "team_id", "opposition_final_third_entries_10s"]]
-)
-
-variable_df14 = _team_stats.merge(
-    _opposition,
-    on=["game_id", "team_id"],
-    how="left",
-)[
-    [
-        "game_id",
-        "team_id",
-        "final_third_entries_10s",
-        "opposition_final_third_entries_10s",
-    ]
-]
-
+# Definition: shared zone / 10 s tables built before # 6 (docs/variable_consistency_decisions.md D2, D4).
+variable_df14 = tc.to_opponent(_regain_count("reaches_third", "in_third", "opposition_final_third_entries_10s"), GAME_TEAMS)
 variable_df14.head(100).to_csv("variable_df14.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -2300,152 +1275,8 @@ successfully enters the penalty box within 10 seconds after recovering possessio
 helps in understanding how quickly and effectively the opposition can transition from defense 
 to attack and create potential scoring opportunities in the penalty area."""
 
-# Opp. Box Entries Within 10s After Recovery
-#
-# For each team T, the number of the OPPONENT's recoveries that are
-# followed by a penalty-box entry within 10 seconds. Captures how often
-# the opposition converts a regained ball into a fast attack reaching
-# the box. Direct analog of variable_df14_code.py with the final-third
-# zone replaced by the penalty box.
-#
-# Recovery events (same set as variable_df11_code.py / variable_df14_code.py):
-#   type_id 49  Ball recovery            (Opta outcome always 1, ref line 818)
-#   type_id 8   Interception             (Opta outcome always 1, ref line 772
-#                                         of Opta-f24_appendices.md; verified
-#                                         empirically on 1955764.json: 21/21
-#                                         type-8 events with outcome=1)
-#   type_id 7   Tackle,     outcome=True
-#   type_id 44  Aerial,     outcome=True
-#   type_id 11  Claim,      outcome=True
-#
-# Penalty box: Opta F24 Appendix 11 (reference/Opta-f24_appendices.md
-# line 957) places the 18-yard box at x >= 83 and 21.1 <= y <= 78.9.
-# A box-entry event is any event whose END coordinates land in the box,
-# which is exactly the union of "crossed in" and "already in, stayed in"
-# (the two disjuncts in the original code).
-#
-# Recovery inside the box: if the recovery event itself ends in the box
-# (a high press won deep), it self-pairs at delta=0 and counts as a
-# successful fast box entry. merge_asof with allow_exact_matches=True
-# and direction="forward" gives that behavior for free.
-#
-# Pairing: pd.merge_asof(recoveries, box_entries, direction="forward",
-# by=[game_id, team_id, period_id]) finds, for each recovery, the
-# earliest same-team event at or after recovery_time whose end
-# coordinates land in the box. If the gap is <= 10s the recovery is
-# counted. O(n log n) and exact, versus the original nested iterrows
-# + per-event apply. Grouping by period_id prevents a recovery at the
-# end of H1 from being paired with an event at the start of H2
-# (progcarry_df `time` is per-period seconds).
-#
-# Short-chain bias: the original gated recoveries on `first_chain == 1`,
-# which possession_chain_code.py only sets on chains of >= 2 events, so
-# single-event possessions were silently dropped. The event-type mask
-# alone carries the "team won the ball" semantics.
-#
-# Semantic fix: the original iterated (game_id, team_id) groups and
-# paired THIS team's recoveries with the OPPOSITION's next 10s of
-# events, then never applied an opposition swap at the end. That stored
-# the wrong value against each team. This rewrite mirrors
-# variable_df14_code.py: count fast-transition recoveries per team,
-# then swap so team T's row carries the OPPONENT's count.
-#
-# NaN preservation: the post-merge `fillna(0)` is intentionally NOT
-# applied. The Z-score pipeline can't distinguish "opponent had 0 fast
-# box entries" (a legitimate league extreme) from "team was missing
-# entirely from progcarry_df" — a 0 in the second case sits at the
-# league mean and biases the Z. Same reasoning as the rest of the
-# defensive-metric suite (e.g. variable_df14_code.py).
-
-BOX_X = 83.0
-BOX_Y_MIN = 21.1
-BOX_Y_MAX = 78.9
-WINDOW_SECONDS = 10.0
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | ((_type_id == 8))
-    | ((_type_id == 44) & _outcome)
-    | ((_type_id == 11) & _outcome)
-)
-
-_box_entry_mask = (
-    (progcarry_df["end_x"] >= BOX_X)
-    & (progcarry_df["end_y"] >= BOX_Y_MIN)
-    & (progcarry_df["end_y"] <= BOX_Y_MAX)
-)
-
-_recoveries = (
-    progcarry_df.loc[_recovery_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_box_entries = (
-    progcarry_df.loc[_box_entry_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "entry_time"})
-    .sort_values("entry_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# For each recovery, find the earliest same-team box-entry event at or
-# after the recovery. allow_exact_matches=True lets a recovery whose own
-# event already lands in the box self-pair at delta=0.
-_paired = pd.merge_asof(
-    _recoveries,
-    _box_entries,
-    left_on="recovery_time",
-    right_on="entry_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=True,
-)
-
-_paired["within_window"] = (
-    _paired["entry_time"].notna()
-    & ((_paired["entry_time"] - _paired["recovery_time"]) <= WINDOW_SECONDS)
-)
-
-_team_stats = (
-    _paired.groupby(["game_id", "team_id"], as_index=False)["within_window"]
-    .sum()
-    .rename(columns={"within_window": "box_entries_10s"})
-)
-_team_stats["box_entries_10s"] = _team_stats["box_entries_10s"].astype(int)
-
-# Opposition swap: attach each team's count to the OTHER team's row.
-_opposition = (
-    _team_stats.merge(
-        _team_stats.rename(
-            columns={
-                "team_id": "opponent_team_id",
-                "box_entries_10s": "opposition_box_entries_10s",
-            }
-        ),
-        on="game_id",
-    )
-    .query("team_id != opponent_team_id")
-    [["game_id", "team_id", "opposition_box_entries_10s"]]
-)
-
-variable_df15 = _team_stats.merge(
-    _opposition,
-    on=["game_id", "team_id"],
-    how="left",
-)[
-    [
-        "game_id",
-        "team_id",
-        "box_entries_10s",
-        "opposition_box_entries_10s",
-    ]
-]
-
+# Definition: shared zone / 10 s tables built before # 6 (docs/variable_consistency_decisions.md D2, D4).
+variable_df15 = tc.to_opponent(_regain_count("reaches_box", "in_box", "opposition_box_entries_10s"), GAME_TEAMS)
 variable_df15.head(100).to_csv("variable_df15.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -2465,153 +1296,8 @@ helps in understanding the quality of scoring chances the opposition creates qui
 regaining the ball. It provides insight into the effectiveness of the opponent's counter-attacking
 capabilities."""
 
-# Opposition xG Within 10s After Recovery
-#
-# For each team T, the total non-penalty xG from the OPPONENT's shots
-# that occur within 10 seconds of the opponent winning the ball.
-# Captures the quality of chances the opposition creates from fast
-# counter-attacks. Direct analog of variable_df14_code.py /
-# variable_df15_code.py, but accumulates xG on shots instead of
-# counting recoveries that reached a zone.
-#
-# Recovery events (same set as variable_df11_code.py):
-#   type_id 49  Ball recovery            (Opta outcome always 1, ref line 818)
-#   type_id 8   Interception             (Opta outcome always 1, ref line 772
-#                                         of Opta-f24_appendices.md; verified
-#                                         empirically on 1955764.json: 21/21
-#                                         type-8 events with outcome=1)
-#   type_id 7   Tackle,     outcome=True
-#   type_id 44  Aerial,     outcome=True
-#   type_id 11  Claim,      outcome=True
-#
-# Shot selection: any progcarry_df row with xG > 0. The xG column is
-# already present on progcarry_df, so the original code's legacy re-merge
-# from a separate `xg_df` is dropped -- that merge collides with the
-# existing `xG` column under current pandas behavior and either raises
-# or drops the merged column silently.
-#
-# Non-penalty filter: penalties are flagged by Opta qualifier 9 (ref
-# line 213), detected via the has_qualifier helper.
-#
-# Pairing: for each shot, find the most recent same-team recovery at or
-# before the shot (pd.merge_asof direction="backward"). If the gap is
-# <= 10s the shot's xG is attributed to that recovery window. This
-# shot-side asof is the natural fit for "accumulated xG" -- every shot
-# contributes at most once, and a single recovery can carry xG from
-# multiple shots within its 10s window. Grouping by period_id prevents
-# cross-half pairings (progcarry_df `time` is per-period seconds).
-#
-# Short-chain bias: the original gated recoveries on `first_chain == 1`,
-# which possession_chain_code.py only sets on chains of >= 2 events,
-# silently dropping fast transitions. The event-type mask alone carries
-# the "team won the ball" semantics.
-#
-# Semantic fix: the original paired THIS team's recoveries with
-# OPPOSITION events in the next 10s, then never applied an opposition
-# swap, storing the wrong value against each team. This rewrite sums
-# fast-transition xG per team, then swaps so team T's row carries the
-# OPPONENT's sum.
-#
-# NaN preservation: the post-merge `fillna(0)` is intentionally NOT
-# applied. The Z-score pipeline can't distinguish "opponent generated
-# 0 fast-transition xG" (a legitimate league extreme) from "team was
-# missing entirely from progcarry_df" — a 0 in the second case sits
-# at the league mean and biases the Z. Same reasoning as the rest of
-# the defensive-metric suite (e.g. variable_df14_code.py).
-
-WINDOW_SECONDS = 10.0
-
-# Merge xG from xg_df onto progcarry_df if the column is missing
-if "xG" not in progcarry_df.columns:
-    progcarry_df = progcarry_df.merge(
-        xg_df[["game_id", "event_id", "xG"]],
-        on=["game_id", "event_id"],
-        how="left",
-    )
-    progcarry_df["xG"] = progcarry_df["xG"].fillna(0.0)
-    if (progcarry_df["xG"] != 0).sum() == 0:
-        raise RuntimeError("xG merge produced all-zero xG column — event_id key space drift between xg_df and progcarry_df")
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | ((_type_id == 8))
-    | ((_type_id == 44) & _outcome)
-    | ((_type_id == 11) & _outcome)
-)
-
-_is_penalty = progcarry_df["qualifiers"].apply(lambda q: has_qualifier(q, 9))
-_shot_mask = (progcarry_df["xG"] > 0) & ~_is_penalty
-
-_recoveries = (
-    progcarry_df.loc[_recovery_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_shots = (
-    progcarry_df.loc[_shot_mask, ["game_id", "team_id", "period_id", "time", "xG"]]
-    .rename(columns={"time": "shot_time"})
-    .sort_values("shot_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# For each shot, find the most recent same-team recovery at or before
-# the shot in the same (game, period). Shots with a qualifying recovery
-# within 10s contribute their xG; shots outside the window are dropped.
-_paired = pd.merge_asof(
-    _shots,
-    _recoveries,
-    left_on="shot_time",
-    right_on="recovery_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="backward",
-    allow_exact_matches=True,
-)
-
-_paired = _paired.loc[
-    _paired["recovery_time"].notna()
-    & ((_paired["shot_time"] - _paired["recovery_time"]) <= WINDOW_SECONDS)
-].copy()
-
-_team_stats = (
-    _paired.groupby(["game_id", "team_id"], as_index=False)["xG"]
-    .sum()
-    .rename(columns={"xG": "xG_10s"})
-)
-
-# Opposition swap: attach each team's total to the OTHER team's row.
-_opposition = (
-    _team_stats.merge(
-        _team_stats.rename(
-            columns={
-                "team_id": "opponent_team_id",
-                "xG_10s": "opposition_xG_10s",
-            }
-        ),
-        on="game_id",
-    )
-    .query("team_id != opponent_team_id")
-    [["game_id", "team_id", "opposition_xG_10s"]]
-)
-
-variable_df16 = _team_stats.merge(
-    _opposition,
-    on=["game_id", "team_id"],
-    how="left",
-)[
-    [
-        "game_id",
-        "team_id",
-        "xG_10s",
-        "opposition_xG_10s",
-    ]
-]
-
+# Definition: shared zone / 10 s tables built before # 6 (docs/variable_consistency_decisions.md D2, D4).
+variable_df16 = tc.to_opponent(REGAINS.groupby(["game_id", "team_id"])["xg"].sum().rename("opposition_xG_10s").reset_index(), GAME_TEAMS)
 variable_df16.head(100).to_csv("variable_df16.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -2632,46 +1318,11 @@ variable_df = variable_df.merge(
 it. This can include various scenarios such as intercepting passes, winning duels, or collecting
 loose balls."""
 
-# Recoveries
-#
-# Count of times a team regains possession of the ball, per team per
-# game. Matches the recovery event set used by variable_df11 / df13 /
-# df14 / df15 / df16 (the recovery-based transition metrics) so all
-# "recovery"-based metrics stay consistent.
-#
-# Recovery events:
-#   type_id 49  Ball recovery            (Opta outcome always 1)
-#   type_id 7   Tackle,     outcome=True (successful tackle wins possession)
-#   type_id 8   Interception             (Opta outcome always 1 in sample)
-#   type_id 44  Aerial,     outcome=True (wins the aerial duel)
-#   type_id 11  Claim,      outcome=True (GK cleanly catches the cross)
-#
-# Chain guard: the original code gated on `first_chain == 1`, which
-# possession_chain_code.py only sets on chains of >= 2 events. That
-# silently dropped isolated single-event recoveries (team wins ball
-# then immediately loses it again) and any genuine recovery event that
-# happened not to start a valid chain. The event-type mask alone
-# carries the "team won the ball" semantics, so the chain guard is
-# removed.
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | ((_type_id == 8))
-    | ((_type_id == 44) & _outcome)
-    | ((_type_id == 11) & _outcome)
-)
-
+# Regains (D4, reference `possession_won`): interception, tackle won, ball recovery (8, 7/1, 49) followed by an
+# own-team event; consecutive recoveries of one regain count once. No GK claims, no aerials.
 variable_df17 = (
-    progcarry_df.loc[_recovery_mask, ["game_id", "team_id"]]
-    .groupby(["game_id", "team_id"], as_index=False)
-    .size()
-    .rename(columns={"size": "recoveries"})
+    progcarry_df[REGAIN_ROWS].groupby(["game_id", "team_id"]).size().rename("recoveries").reset_index()
 )
-
 variable_df17.head(100).to_csv("variable_df17.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -2691,66 +1342,11 @@ variable_df = variable_df.merge(
 (regaining possession) occur. This metric helps in understanding at what point on the pitch a team
 or player typically regains possession."""
 
-# Recovery Line Height (m)
-#
-# Average pitch height at which a team wins the ball back, expressed in
-# meters from that team's own goal line. Downstream code uses this to
-# characterize how high up the pitch a side recovers possession.
-#
-# Coordinate & unit note: per Opta F24 Appendix 11 (reference/Opta-f24_
-# appendices.md line 950), start_x is a 0-100 percentage normalized L->R
-# in the event team's attacking direction. To report meters we scale by
-# the UEFA-standard pitch length (105 m), matching possession_chain_code.py
-# (PITCH_LENGTH_M = 105.0) and variable_df10_code.py.
-#
-# Recovery events (same set as variable_df11 / variable_df17):
-#   type_id 49  Ball recovery            (Opta outcome always 1)
-#   type_id 7   Tackle,     outcome=True (successful tackle wins possession)
-#   type_id 8   Interception             (Opta outcome always 1 in sample)
-#   type_id 44  Aerial,     outcome=True (wins the aerial duel)
-#   type_id 11  Claim,      outcome=True (GK cleanly catches the cross)
-#
-# Location: start_x is used (not end_x) so the recovery is located at
-# the point it occurred. This matches variable_df10_code.py's choice for
-# turnover line height.
-#
-# Chain guard: the original code gated on `first_chain == 1`, which
-# possession_chain_code.py only sets on chains of >= 2 events, silently
-# dropping isolated single-event recoveries. The event-type mask alone
-# carries the "team won the ball" semantics.
-#
-# NaN handling: if a team had no qualifying recoveries in a game, the
-# merged column is left as NaN rather than filled with 0. A value of
-# 0 m would place the recovery line on the team's own goal line and
-# bias any downstream averaging, same as variable_df10_code.py.
-
-PITCH_LENGTH_M = 105.0
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | ((_type_id == 8))
-    | ((_type_id == 44) & _outcome)
-    | ((_type_id == 11) & _outcome)
-)
-
-recoveries = progcarry_df.loc[
-    _recovery_mask,
-    ["game_id", "team_id", "start_x"],
-]
-
+# Mean height of the regains (D4), metres.
 variable_df18 = (
-    recoveries.groupby(["game_id", "team_id"], as_index=False)["start_x"]
-    .mean()
-    .rename(columns={"start_x": "recovery_height"})
+    progcarry_df[REGAIN_ROWS].groupby(["game_id", "team_id"])["start_x"].mean()
+    .mul(tc.X_METRES).rename("recovery_height").reset_index()
 )
-variable_df18["recovery_height"] = (
-    variable_df18["recovery_height"] * PITCH_LENGTH_M / 100.0
-)
-
 variable_df18.head(100).to_csv("variable_df18.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -2780,12 +1376,7 @@ is an indicator of effective ball control and composure in maintaining possessio
 # min(time) per chain, consistent with the possession dataframe and
 # pass tempo calculations earlier in the pipeline.
 #
-# Short-chain note: possession_chain_code.py sets possessionId = 0 for
-# chains of < 2 events (MIN_CHAIN_LEN = 2). Single-event "possessions"
-# therefore never appear with last_chain == 1 and are excluded here --
-# but a 1-event chain has zero duration by construction and could not
-# have met the 5s threshold anyway, so this bias is harmless for this
-# specific metric.
+# Chain note: chain ids start at 1 (ref_pipeline.chains_table); the != 0 filter keeps every chain.
 
 RETENTION_THRESHOLD_SECONDS = 5.0
 
@@ -2842,14 +1433,7 @@ turnovers. It is an indicator of effective ball control and composure in maintai
 # min(time) per chain, consistent with variable_df19 and the possession
 # dataframe calculations earlier in the pipeline.
 #
-# Note on possession chain coverage: possession_chain.py has no
-# MIN_CHAIN_LEN logic -- it does not exclude short chains, so this
-# metric counts every chain (including any single-event chains) for
-# that team-game. The previous implementation filtered possessionId
-# != 0, which silently dropped only the very first chain of the
-# entire parquet (one chain in one game out of ~380); removed for
-# cleanliness. A single-event chain contributes 0 duration so it
-# trivially fails the 5s threshold and only affects the denominator.
+# Chain note: chain ids start at 1 (ref_pipeline.chains_table); the != 0 filter keeps every chain.
 
 RETENTION_THRESHOLD_SECONDS = 5.0
 
@@ -2907,110 +1491,8 @@ metric helps in understanding the effectiveness and speed of a team's transition
 attack. It indicates how quickly a team can create potential scoring opportunities after recovering
 the ball."""
 
-# Final Third Entries Within 10s After Recovery
-#
-# Per team per game, the number of the team's OWN recoveries that are
-# followed by a final-third event within 10 seconds. Captures how often
-# the side converts a regained ball into a fast attack reaching the
-# final third. Same machinery as variable_df14 (opposition variant),
-# minus the opposition swap.
-#
-# Recovery events (same set as variable_df11 / variable_df14):
-#   type_id 49  Ball recovery            (Opta outcome always 1)
-#   type_id 7   Tackle,     outcome=True
-#   type_id 8   Interception             (Opta outcome always 1 in sample)
-#   type_id 44  Aerial,     outcome=True
-#   type_id 11  Claim,      outcome=True
-#
-# Final-third entry event: any event with end_x >= 200/3 (~66.67). Opta
-# F24 Appendix 11 (reference/Opta-f24_appendices.md line 950) normalizes
-# every event L->R in the event team's attacking direction, so end_x >=
-# 2/3 is always the event team's attacking third. This is the single-
-# predicate union of the original code's "crossed into" and "already in"
-# disjunctions.
-#
-# Recovery inside the final third: a recovery whose own event already
-# lands in the final third (a high press won deep) self-pairs at
-# delta=0 via allow_exact_matches=True + direction="forward", matching
-# the behavior of variable_df14_code.py.
-#
-# Pairing: pd.merge_asof(recoveries, entry_events, direction="forward",
-# by=[game_id, team_id, period_id]) finds, for each recovery, the
-# earliest same-team event at or after recovery_time whose end_x lands
-# in the final third. If the gap is <= 10s the recovery is counted as
-# a successful fast transition. O(n log n) and exact, versus the
-# original nested iterrows + full-frame filter per recovery. Grouping
-# by period_id prevents cross-half pairings since progcarry_df `time`
-# is per-period seconds.
-#
-# Short-chain bias: the original gated recoveries on `first_chain == 1`,
-# which possession_chain_code.py only sets on chains of >= 2 events,
-# silently dropping fast transitions. The event-type mask alone carries
-# the "team won the ball" semantics.
-#
-# NaN preserved: missing-team rows in the merge are ambiguous between
-# "real zero" and "missing data". Per project convention, leave NaN so
-# the downstream Z-score step skips them rather than treating missing
-# data as a far-low outlier.
-
-FINAL_THIRD = 200.0 / 3.0
-WINDOW_SECONDS = 10.0
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | ((_type_id == 8))
-    | ((_type_id == 44) & _outcome)
-    | ((_type_id == 11) & _outcome)
-)
-
-_recoveries = (
-    progcarry_df.loc[_recovery_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_entry_events = (
-    progcarry_df.loc[
-        progcarry_df["end_x"] >= FINAL_THIRD,
-        ["game_id", "team_id", "period_id", "time"],
-    ]
-    .rename(columns={"time": "entry_time"})
-    .sort_values("entry_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# For each recovery, find the earliest same-team final-third event at or
-# after the recovery. allow_exact_matches=True lets a recovery whose own
-# event already lands in the final third self-pair at delta=0.
-_paired = pd.merge_asof(
-    _recoveries,
-    _entry_events,
-    left_on="recovery_time",
-    right_on="entry_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=True,
-)
-
-_paired["within_window"] = (
-    _paired["entry_time"].notna()
-    & ((_paired["entry_time"] - _paired["recovery_time"]) <= WINDOW_SECONDS)
-)
-
-variable_df21 = (
-    _paired.groupby(["game_id", "team_id"], as_index=False)["within_window"]
-    .sum()
-    .rename(columns={"within_window": "final_third_entries_10s"})
-)
-variable_df21["final_third_entries_10s"] = (
-    variable_df21["final_third_entries_10s"].astype(int)
-)
-
+# Definition: shared zone / 10 s tables built before # 6 (docs/variable_consistency_decisions.md D2, D4).
+variable_df21 = _regain_count("reaches_third", "in_third", "final_third_entries_10s")
 variable_df21.head(100).to_csv("variable_df21.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -3030,111 +1512,8 @@ helps in understanding the effectiveness and speed of a team's transition from d
 It indicates how quickly a team can create potential scoring opportunities in the penalty area after
 recovering the ball."""
 
-# Box Entries Within 10s After Recovery
-#
-# Per team per game, the number of the team's OWN recoveries that are
-# followed by a penalty-box entry within 10 seconds. Captures how often
-# the side converts a regained ball into a fast attack reaching the box.
-# Same machinery as variable_df15 (opposition variant), minus the
-# opposition swap.
-#
-# Recovery events (same set as variable_df11 / variable_df15):
-#   type_id 49  Ball recovery            (Opta outcome always 1)
-#   type_id 7   Tackle,     outcome=True
-#   type_id 8   Interception             (Opta outcome always 1 in sample)
-#   type_id 44  Aerial,     outcome=True
-#   type_id 11  Claim,      outcome=True
-#
-# Penalty box: Opta F24 Appendix 11 (reference/Opta-f24_appendices.md
-# line 957) places the 18-yard box at x >= 83 and 21.1 <= y <= 78.9.
-# A box-entry event is any event whose END coordinates land in the box,
-# which is the single-predicate union of "crossed in" and "already in,
-# stayed in".
-#
-# Recovery inside the box: a recovery whose own event ends in the box
-# (a high press won deep) self-pairs at delta=0 via
-# allow_exact_matches=True + direction="forward", matching the behavior
-# of variable_df14 / variable_df15 / variable_df21.
-#
-# Pairing: pd.merge_asof(recoveries, box_entries, direction="forward",
-# by=[game_id, team_id, period_id]) finds, for each recovery, the
-# earliest same-team event at or after recovery_time whose end
-# coordinates land in the box. If the gap is <= 10s the recovery is
-# counted. O(n log n) and exact, versus the original nested iterrows +
-# per-event apply. Grouping by period_id prevents cross-half pairings
-# since progcarry_df `time` is per-period seconds.
-#
-# Short-chain bias: the original gated recoveries on `first_chain == 1`,
-# which possession_chain_code.py only sets on chains of >= 2 events,
-# silently dropping fast transitions. The event-type mask alone carries
-# the "team won the ball" semantics.
-#
-# NaN preserved: missing-team rows in the merge are ambiguous between
-# "real zero" and "missing data". Per project convention, leave NaN so
-# the downstream Z-score step skips them rather than treating missing
-# data as a far-low outlier.
-
-BOX_X = 83.0
-BOX_Y_MIN = 21.1
-BOX_Y_MAX = 78.9
-WINDOW_SECONDS = 10.0
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | ((_type_id == 8))
-    | ((_type_id == 44) & _outcome)
-    | ((_type_id == 11) & _outcome)
-)
-
-_box_entry_mask = (
-    (progcarry_df["end_x"] >= BOX_X)
-    & (progcarry_df["end_y"] >= BOX_Y_MIN)
-    & (progcarry_df["end_y"] <= BOX_Y_MAX)
-)
-
-_recoveries = (
-    progcarry_df.loc[_recovery_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_box_entries = (
-    progcarry_df.loc[_box_entry_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "entry_time"})
-    .sort_values("entry_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# For each recovery, find the earliest same-team box-entry event at or
-# after the recovery. allow_exact_matches=True lets a recovery whose own
-# event already lands in the box self-pair at delta=0.
-_paired = pd.merge_asof(
-    _recoveries,
-    _box_entries,
-    left_on="recovery_time",
-    right_on="entry_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=True,
-)
-
-_paired["within_window"] = (
-    _paired["entry_time"].notna()
-    & ((_paired["entry_time"] - _paired["recovery_time"]) <= WINDOW_SECONDS)
-)
-
-variable_df22 = (
-    _paired.groupby(["game_id", "team_id"], as_index=False)["within_window"]
-    .sum()
-    .rename(columns={"within_window": "box_entries_10s"})
-)
-variable_df22["box_entries_10s"] = variable_df22["box_entries_10s"].astype(int)
-
+# Definition: shared zone / 10 s tables built before # 6 (docs/variable_consistency_decisions.md D2, D4).
+variable_df22 = _regain_count("reaches_box", "in_box", "box_entries_10s")
 variable_df22.head(100).to_csv("variable_df22.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -3153,115 +1532,8 @@ shots taken within 10 seconds after a team regains possession. This metric helps
 the quality of scoring chances created quickly after recovering the ball. It provides insight into
 the effectiveness of a team's counter-attacking capabilities."""
 
-# xG Within 10s After Recovery
-#
-# Per team per game, the total non-penalty xG from the team's OWN shots
-# that occur within 10 seconds of the team winning the ball. Captures
-# the quality of chances a side creates from fast counter-attacks.
-# Same machinery as variable_df16 (opposition variant), minus the
-# opposition swap.
-#
-# Recovery events (same set as variable_df11 / variable_df16):
-#   type_id 49  Ball recovery            (Opta outcome always 1)
-#   type_id 7   Tackle,     outcome=True
-#   type_id 8   Interception             (Opta outcome always 1 in sample)
-#   type_id 44  Aerial,     outcome=True
-#   type_id 11  Claim,      outcome=True
-#
-# Shot selection: any progcarry_df row with xG > 0. The xG column is
-# already present on progcarry_df, so no legacy re-merge from a separate
-# `xg_df` is needed.
-#
-# Non-penalty filter: penalties are flagged by Opta qualifier 9 (ref
-# line 213), detected via the has_qualifier helper.
-#
-# Pairing: for each shot, find the most recent same-team recovery at or
-# before the shot (pd.merge_asof direction="backward"). If the gap is
-# <= 10s the shot's xG is attributed to that recovery window. This
-# shot-side asof is the natural fit for "accumulated xG" -- every shot
-# contributes at most once, and a single recovery can carry xG from
-# multiple shots within its 10s window. Grouping by period_id prevents
-# cross-half pairings since progcarry_df `time` is per-period seconds.
-#
-# Short-chain bias: the original gated recoveries on `first_chain == 1`,
-# which possession_chain_code.py only sets on chains of >= 2 events,
-# silently dropping fast transitions. The event-type mask alone carries
-# the "team won the ball" semantics.
-#
-# Double-counting fix: the original iterated recovery-side and, for each
-# recovery, added every shot in the next 10s -- so a shot reachable from
-# two recoveries had its xG counted twice. Shot-side backward merge_asof
-# attributes each shot to exactly one recovery.
-#
-# NaN preserved: missing-team rows in the merge are ambiguous between
-# "real zero" and "missing data". Per project convention, leave NaN so
-# the downstream Z-score step skips them rather than treating missing
-# data as a far-low outlier.
-
-WINDOW_SECONDS = 10.0
-
-if "xG" not in progcarry_df.columns:
-    progcarry_df = progcarry_df.merge(
-        xg_df[["game_id", "event_id", "xG"]],
-        on=["game_id", "event_id"],
-        how="left",
-    )
-    progcarry_df["xG"] = progcarry_df["xG"].fillna(0.0)
-    if (progcarry_df["xG"] != 0).sum() == 0:
-        raise RuntimeError("xG merge produced all-zero xG column — event_id key space drift between xg_df and progcarry_df")
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | ((_type_id == 8))
-    | ((_type_id == 44) & _outcome)
-    | ((_type_id == 11) & _outcome)
-)
-
-_is_penalty = progcarry_df["qualifiers"].apply(lambda q: has_qualifier(q, 9))
-_shot_mask = (progcarry_df["xG"] > 0) & ~_is_penalty
-
-_recoveries = (
-    progcarry_df.loc[_recovery_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_shots = (
-    progcarry_df.loc[_shot_mask, ["game_id", "team_id", "period_id", "time", "xG"]]
-    .rename(columns={"time": "shot_time"})
-    .sort_values("shot_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# For each shot, find the most recent same-team recovery at or before
-# the shot in the same (game, period). Shots with a qualifying recovery
-# within 10s contribute their xG; shots outside the window are dropped.
-_paired = pd.merge_asof(
-    _shots,
-    _recoveries,
-    left_on="shot_time",
-    right_on="recovery_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="backward",
-    allow_exact_matches=True,
-)
-
-_paired = _paired.loc[
-    _paired["recovery_time"].notna()
-    & ((_paired["shot_time"] - _paired["recovery_time"]) <= WINDOW_SECONDS)
-].copy()
-
-variable_df23 = (
-    _paired.groupby(["game_id", "team_id"], as_index=False)["xG"]
-    .sum()
-    .rename(columns={"xG": "xG_10s"})
-)
-
+# Definition: shared zone / 10 s tables built before # 6 (docs/variable_consistency_decisions.md D2, D4).
+variable_df23 = REGAINS.groupby(["game_id", "team_id"])["xg"].sum().rename("xG_10s").reset_index()
 variable_df23.head(100).to_csv("variable_df23.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -3281,106 +1553,8 @@ such as passes, dribbles, or carries within 10 seconds after a team regains poss
 helps in understanding the potential impact and danger created quickly after recovering the ball.
 It provides insight into the effectiveness of a team's counter-attacking capabilities."""
 
-# xT Within 10s After Recovery
-#
-# Per team per game, the total xT (expected threat) accumulated on the
-# team's OWN events that occur within 10 seconds of the team winning
-# the ball. Captures the danger a side creates from fast counter-
-# attacks. Direct analog of variable_df23 with xthreat replacing
-# non-penalty xG.
-#
-# Recovery events (same set as variable_df11 / variable_df23):
-#   type_id 49  Ball recovery            (Opta outcome always 1)
-#   type_id 7   Tackle,     outcome=True
-#   type_id 8   Interception             (Opta outcome always 1 in sample)
-#   type_id 44  Aerial,     outcome=True
-#   type_id 11  Claim,      outcome=True
-#
-# xT event selection: any progcarry_df row with xthreat > 0.
-# The xthreat column contains continuous xT values merged from
-# xT_brasileirao_2026.parquet; events without xT are filled with 0.
-#
-# Pairing: for each xT-bearing event, find the most recent same-team
-# recovery at or before the event (pd.merge_asof direction="backward").
-# If the gap is <= 10s the event's xthreat is attributed to that
-# recovery window. This event-side asof is the natural fit for
-# "accumulated xT" -- every event contributes at most once, and a
-# single recovery can carry xT from multiple events within its 10s
-# window. Grouping by period_id prevents cross-half pairings since
-# progcarry_df `time` is per-period seconds.
-#
-# Short-chain bias: the original gated recoveries on `first_chain == 1`,
-# which possession_chain_code.py only sets on chains of >= 2 events,
-# silently dropping fast transitions. The event-type mask alone carries
-# the "team won the ball" semantics.
-#
-# Double-counting fix: the original iterated recovery-side and, for
-# each recovery, added every xT event in the next 10s -- so an event
-# reachable from two recoveries had its xthreat counted twice.
-# Event-side backward merge_asof attributes each event to exactly one
-# recovery.
-#
-# NaN preserved: missing-team rows in the merge are ambiguous between
-# "real zero" and "missing data". Per project convention, leave NaN so
-# the downstream Z-score step skips them rather than treating missing
-# data as a far-low outlier.
-
-WINDOW_SECONDS = 10.0
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | ((_type_id == 8))
-    | ((_type_id == 44) & _outcome)
-    | ((_type_id == 11) & _outcome)
-)
-
-_xt_mask = progcarry_df["xthreat"] > 0
-
-_recoveries = (
-    progcarry_df.loc[_recovery_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_xt_events = (
-    progcarry_df.loc[
-        _xt_mask, ["game_id", "team_id", "period_id", "time", "xthreat"]
-    ]
-    .rename(columns={"time": "event_time"})
-    .sort_values("event_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# For each xT event, find the most recent same-team recovery at or
-# before the event in the same (game, period). Events with a qualifying
-# recovery within 10s contribute their xthreat; events outside the
-# window are dropped.
-_paired = pd.merge_asof(
-    _xt_events,
-    _recoveries,
-    left_on="event_time",
-    right_on="recovery_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="backward",
-    allow_exact_matches=True,
-)
-
-_paired = _paired.loc[
-    _paired["recovery_time"].notna()
-    & ((_paired["event_time"] - _paired["recovery_time"]) <= WINDOW_SECONDS)
-].copy()
-
-variable_df24 = (
-    _paired.groupby(["game_id", "team_id"], as_index=False)["xthreat"]
-    .sum()
-    .rename(columns={"xthreat": "xT_10s"})
-)
-
+# Definition: shared zone / 10 s tables built before # 6 (docs/variable_consistency_decisions.md D2, D4).
+variable_df24 = REGAINS.groupby(["game_id", "team_id"])["xt"].sum().rename("xT_10s").reset_index()
 variable_df24.head(100).to_csv("variable_df24.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -3485,112 +1659,15 @@ variable_df = variable_df.merge(
 for a particular team compared to their opponent. This metric helps in understanding which team 
 is more dominant in terms of territorial control and attacking pressure during a match."""
 
-# Field Tilt %
-#
-# Per team per game, the share of "time in the attacking half" between
-# the two sides. Follows the task definition ("% of time the ball is in
-# the attacking half compared to opponent") rather than the alternative
-# community definition (share of final-third passes, Caley/StatsBomb).
-#
-# Coordinate note: per Opta F24 Appendix 11 (reference/Opta-f24_
-# appendices.md line 950), start_x / end_x are 0-100 percentages
-# normalized L->R in the event team's attacking direction. x >= 50 is
-# always the event team's attacking half.
-#
-# Attribution algorithm: iterate the *global* per-game, per-period
-# event timeline (both teams together), sorted by (period_id, time,
-# event_index). For each consecutive event pair, the gap
-#   delta = next.time - current.time
-# is attributed to the team of the *preceding* event, masked by whether
-# that event's end_x landed in the attacking half. Sum the gaps per
-# (game_id, team_id) to get time_in_attack. Each gap is attributed to
-# exactly one team, so the two sides' totals add up to at most the game
-# duration.
-#
-# Field tilt % = time_in_attack / (time_in_attack + opponent_time_in_attack)
-# * 100, with opposition time pulled via the self-merge opposition-swap
-# pattern used elsewhere in this pipeline.
-#
-# Fixes vs the original:
-#   - Original iterated each team's events in isolation and added the
-#     gap to the NEXT same-team event, attributing opponent possession
-#     time to us whenever our events bracketed theirs.
-#   - Original used `start_x >= 50 OR end_x >= 50`, double-counting any
-#     event that merely crossed the halfway line. end_x >= 50 alone
-#     matches "ball ended up in the attacking half."
-#   - Original did not group by period_id, so the gap from the last
-#     event of period 1 to the first event of period 2 produced a
-#     negative delta (progcarry_df `time` is per-period seconds).
-#   - Original had an O(n^2) iterrows loop; a single global sort +
-#     groupby-diff replaces it.
-#
-# Div-by-zero guard: if total attacking-half time in a game is zero
-# (no events in either half -- should not happen but defensively
-# handled), field_tilt_% stays NaN so the Z-score step treats the row
-# as missing, consistent with the project-wide NaN-preservation
-# convention. Note that the metric's natural neutral is 50%, so filling
-# with 0 would inject a real extreme value and bias league-wide Z.
-
-HALFWAY = 50.0
-
-_events = (
-    progcarry_df[
-        ["game_id", "team_id", "period_id", "time", "end_x", "event_index"]
-    ]
-    .sort_values(["game_id", "period_id", "time", "event_index"], kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# Time to the NEXT event within the same (game, period). The last event
-# of a period has no successor -> NaN delta, which drops out of the sum.
-_events["delta"] = (
-    _events.groupby(["game_id", "period_id"])["time"].shift(-1) - _events["time"]
-)
-
-# Only count gaps where the current event ended in the team's
-# attacking half.
-_events["attack_delta"] = np.where(
-    (_events["end_x"] >= HALFWAY) & _events["delta"].notna(),
-    _events["delta"],
-    0.0,
-)
-
-_team_stats = (
-    _events.groupby(["game_id", "team_id"], as_index=False)["attack_delta"]
-    .sum()
-    .rename(columns={"attack_delta": "time_in_attack"})
-)
-
-# Opposition swap: attach each team's time_in_attack to the OTHER team.
-_opposition = (
-    _team_stats.merge(
-        _team_stats.rename(
-            columns={
-                "team_id": "opponent_team_id",
-                "time_in_attack": "opponent_time_in_attack",
-            }
-        ),
-        on="game_id",
-    )
-    .query("team_id != opponent_team_id")
-    [["game_id", "team_id", "opponent_time_in_attack"]]
-)
-
-variable_df26 = _team_stats.merge(
-    _opposition,
-    on=["game_id", "team_id"],
-    how="left",
-)
-
-_total = variable_df26["time_in_attack"] + variable_df26["opponent_time_in_attack"]
-variable_df26["field_tilt_%"] = np.where(
-    _total > 0,
-    variable_df26["time_in_attack"] / _total * 100.0,
-    np.nan,
-)
-
-variable_df26 = variable_df26[["game_id", "team_id", "field_tilt_%"]]
-
+# Field tilt (D7): the team's share of both teams' final-third (x >= 66.67) possession touches — reference
+# `possession_touch` (passes, shots, take-ons, touches, carries; no restarts, penalties, own goals).
+_t26 = progcarry_df[tc.possession_touch(progcarry_df) & tc.in_final_third(progcarry_df["start_x"])]
+_own26 = GAME_TEAMS.merge(_t26.groupby(["game_id", "team_id"]).size().rename("own").reset_index(),
+                          on=["game_id", "team_id"], how="left").fillna({"own": 0})
+_own26 = _own26.merge(tc.to_opponent(_own26, GAME_TEAMS).rename(columns={"own": "opp"}), on=["game_id", "team_id"])
+_tot26 = _own26["own"] + _own26["opp"]
+_own26["field_tilt_%"] = np.where(_tot26 > 0, _own26["own"] / _tot26 * 100.0, np.nan)
+variable_df26 = _own26[["game_id", "team_id", "field_tilt_%"]]
 variable_df26.head(100).to_csv("variable_df26.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -3609,83 +1686,12 @@ that travel a significant distance, typically bypassing the midfield to reach at
 This metric helps in understanding a team's playing style, indicating a preference for a more direct 
 approach to advancing the ball up the field."""
 
-# Long Ball %
-#
-# Per team per game, the share of the team's SUCCESSFUL passes that
-# are long balls. Opta F24 Appendix defines a long ball as a pass
-# over 35 yards (reference/Opta-f24_appendices.md line 138), flagged
-# by qualifier 1 on a type_id == 1 Pass event. "Longball" is a
-# presence-only qualifier -- no value attached -- so the predicate is
-# "qualifier 1 is present on the pass row", not "qualifier 1 equals
-# True".
-#
-# Successful-only choice: the metric definition is ambiguous between
-# "share of all passes" and "share of successful passes". Original
-# code used successful-only and downstream consumers expect that, so
-# the rewrite keeps it. (For an all-passes variant, drop the outcome
-# gate from both numerator and denominator.)
-#
-# Set-piece handling: free kicks (qualifier 5), corners (6), and
-# throw-ins (107) are excluded from both numerator and denominator --
-# corners are long by definition, most direct free kicks are long, and
-# throw-ins from the defensive third inflate the long-ball share for
-# every team in a way that masks actual playing-style differences.
-# Goal kicks (qualifier 124) are KEPT: a team that consistently plays
-# short out of the back vs. one that always launches it long is the
-# exact direct-vs-possession signal this metric is meant to capture,
-# and excluding goal kicks would erase that.
-#
-# Qualifier detection: uses the has_qualifier helper to check for
-# qualifier 1 (long ball) in the qualifiers list-of-dicts format.
-#
-# Replaces the original `qualifiers.apply(lambda x: 1 in x and x[1] == True)`
-# which (a) assumes `qualifiers` is a dict (it's a string in the
-# upstream feed) and (b) checks `== True` on a presence-only qualifier
-# that has no value. The original code silently returns zero long
-# balls for every team.
-#
-# Input source: uses `progcarry_df` (pipeline convention) rather than
-# the original `df` reference -- progcarry_df is the event source of
-# truth across all variable_df* metrics in this pipeline and carries
-# type 1 Pass events.
-#
-# NaN preservation: the internal np.where guard returns NaN when a
-# team-game has zero qualifying passes, and the final merge leaves
-# missing team-games as NaN so the downstream Z-score step treats them
-# as missing rather than as a real 0% long-ball share (which would
-# bias the league mean and the team's Z-score downward).
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-_qualifiers = progcarry_df["qualifiers"]
-
-# Exclude free kicks (5), corners (6), and throw-ins (107). Goal kicks
-# (124) are intentionally kept -- see header comment.
-_is_set_piece = _qualifiers.apply(
-    lambda q: any(has_qualifier(q, qid) for qid in (5, 6, 107))
-)
-
-_pass_mask = (_type_id == 1) & _outcome & ~_is_set_piece
-
-_passes = progcarry_df.loc[_pass_mask, ["game_id", "team_id", "qualifiers"]].copy()
-_passes["is_long"] = _passes["qualifiers"].apply(lambda q: has_qualifier(q, 1)).astype(int)
-_passes = _passes.drop(columns=["qualifiers"])
-
+# Long ball % (D8): q1 passes / all attempted passes; free kicks (q5), corners (q6) and throw-ins (q107) excluded,
+# goal kicks kept (a long goal kick is a style choice).
+_p27 = progcarry_df[(progcarry_df["type_id"] == 1) & ~progcarry_df[["q5", "q6", "q107"]].any(axis=1)]
 variable_df27 = (
-    _passes.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        total_passes=("is_long", "size"),
-        long_balls=("is_long", "sum"),
-    )
+    _p27.groupby(["game_id", "team_id"])["q1"].mean().mul(100.0).rename("long_ball_%").reset_index()
 )
-variable_df27["long_ball_%"] = np.where(
-    variable_df27["total_passes"] > 0,
-    variable_df27["long_balls"] / variable_df27["total_passes"] * 100.0,
-    np.nan,
-)
-
-variable_df27 = variable_df27[["game_id", "team_id", "long_ball_%"]]
-
 variable_df27.head(100).to_csv("variable_df27.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -3728,11 +1734,7 @@ opposition's defensive organization and create scoring opportunities."""
 # frequency at which a team moves the ball through passing") and
 # matches the df5 rewrite.
 #
-# Possession-chain note: possession_chain.py initializes the counter at
-# 0 and increments it after each stop criterion. possessionId == 0 is
-# the first chain of the dataset, not a short-chain sentinel, so it is
-# NOT filtered out -- the prior `possessionId != 0` filter has been
-# removed in lockstep with the orchestrator pipeline-wide cleanup.
+# Chain note: chain ids start at 1 (ref_pipeline.chains_table); the != 0 filter keeps every chain.
 #
 # NaN preservation: the np.where guard returns NaN when a team-game
 # has zero possession seconds, and the final merge leaves missing
@@ -3741,47 +1743,9 @@ opposition's defensive organization and create scoring opportunities."""
 # be a real extreme low value and bias both the league mean and the
 # team's Z-score downward).
 
-_pass_mask = (
-    (progcarry_chains_df["type_id"] == 1)
-    & (progcarry_chains_df["outcome"] == 1)
-)
-successful_passes = (
-    progcarry_chains_df.loc[_pass_mask]
-    .groupby(["game_id", "team_id"])
-    .size()
-    .rename("successful_passes")
-)
-
-# Derive possession seconds from chain durations (max - min time per chain),
-# reusing the same approach as the possession dataframe built earlier.
-_chain_time_28 = progcarry_chains_df["minute"] * 60 + progcarry_chains_df["second"]
-_chain_durations_28 = (
-    progcarry_chains_df.assign(_time=_chain_time_28)
-    .groupby(["game_id", "team_id", "possessionId"])["_time"]
-    .agg(lambda t: t.max() - t.min())
-)
-possession_seconds = (
-    _chain_durations_28
-    .groupby(["game_id", "team_id"])
-    .sum()
-    .rename("possession_seconds")
-)
-
-variable_df28 = (
-    pd.concat([successful_passes, possession_seconds], axis=1)
-    .fillna(0)
-    .reset_index()
-)
-
-variable_df28["pass_tempo"] = np.where(
-    variable_df28["possession_seconds"] > 0,
-    variable_df28["successful_passes"]
-    / (variable_df28["possession_seconds"] / 60.0),
-    np.nan,
-)
-
-variable_df28 = variable_df28[["game_id", "team_id", "pass_tempo"]]
-
+# Same definition as #5 (successful open-play passes per minute of own chain time; set pieces 5/6/107/124
+# excluded), so opposition_pass_tempo is exactly the opponent's pass_tempo (B10).
+variable_df28 = variable_df5[["game_id", "team_id", "pass_tempo"]].copy()
 variable_df28.head(100).to_csv("variable_df28.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -3800,85 +1764,8 @@ progress into the final third of the pitch. This metric helps in understanding h
 team can advance the ball into attacking areas and create potential scoring opportunities. It
 indicates the team's ability to transition from midfield to the attacking third."""
 
-# Possessions to Final Third %
-#
-# Per team per game, the percentage of the team's valid possessions
-# that both started OUTSIDE the final third and later reached the
-# final third. Measures the team's ability to progress the ball from
-# deeper areas into attacking territory.
-#
-# Final third threshold: x >= 200/3 (~66.67). Per Opta F24 Appendix 11
-# (reference/Opta-f24_appendices.md line 950), coordinates are 0-100
-# percentages normalized L->R in the event team's attacking direction,
-# so x >= 2/3 is always the attacking third.
-#
-# Reads from progcarry_chains_df -- the non-destructive valid-chain
-# view built by possession_chain.py (possessionId != 0 means
-# MIN_CHAIN_LEN >= 2). Single-event chains are excluded; they can't
-# progress within themselves so the bias for this metric is small.
-#
-# Algorithm:
-#   1. Per possessionId, get
-#        chain_start_x  = start_x of the FIRST event (chronological
-#                         order, already honored by the chain view's
-#                         native sort on period_id / event_index)
-#        chain_max_end_x = max(end_x) across all events in the chain
-#   2. Denominator: possessions with chain_start_x < 2/3 (started
-#      outside the final third).
-#   3. Numerator: those same possessions where chain_max_end_x >= 2/3
-#      (reached the final third at some point).
-#
-# Correction vs the original:
-#   - The original detected "entered final third" via a single event
-#     whose start_x < 2/3 AND end_x >= 2/3 -- a physical line-crossing.
-#     A possession that enters incrementally (e.g. pass ending at
-#     x=60, then carry ending at x=70) has no single straddling event
-#     and would be missed. max(end_x) >= 2/3 captures the intent.
-#   - The original used nested for-loops + iterrows. A single
-#     groupby-agg replaces it.
-#
-# NaN preservation: the np.where guard returns NaN when a team-game
-# has zero qualifying possessions, and the final merge leaves missing
-# team-games as NaN so the downstream Z-score step treats them as
-# missing rather than as a real 0% final-third-entry team (which would
-# be a real extreme low value and bias both the league mean and the
-# team's Z-score downward).
-
-FINAL_THIRD = 200.0 / 3.0
-
-_chain_stats = (
-    progcarry_chains_df.groupby(
-        ["game_id", "team_id", "possessionId"], as_index=False
-    ).agg(
-        chain_start_x=("start_x", "first"),
-        chain_max_end_x=("end_x", "max"),
-    )
-)
-
-_chain_stats["started_outside"] = _chain_stats["chain_start_x"] < FINAL_THIRD
-_chain_stats["reached"] = (
-    _chain_stats["started_outside"]
-    & (_chain_stats["chain_max_end_x"] >= FINAL_THIRD)
-)
-
-variable_df29 = (
-    _chain_stats.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        total_valid_possessions=("started_outside", "sum"),
-        final_third_entries=("reached", "sum"),
-    )
-)
-
-variable_df29["final_third_entries_%"] = np.where(
-    variable_df29["total_valid_possessions"] > 0,
-    variable_df29["final_third_entries"]
-    / variable_df29["total_valid_possessions"]
-    * 100.0,
-    np.nan,
-)
-
-variable_df29 = variable_df29[["game_id", "team_id", "final_third_entries_%"]]
-
+# Definition: shared zone / 10 s tables built before # 6 (docs/variable_consistency_decisions.md D2, D4).
+variable_df29 = _chain_pct("reaches_third", ~CHAINS["starts_in_third"], "final_third_entries_%")
 variable_df29.head(100).to_csv("variable_df29.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -3897,103 +1784,8 @@ the final third of the pitch into the opponent's penalty box. This metric helps 
 how effectively a team can penetrate the opponent's defensive setup and create potential scoring
 opportunities in the most dangerous area of the field."""
 
-# Final Third to Box %
-#
-# Per team per game, among the team's valid possessions that reached
-# the final third, the percentage that also reached the penalty box.
-# Measures how effectively a side converts final-third presence into
-# box entries.
-#
-# Zones (Opta F24 Appendix 11, reference/Opta-f24_appendices.md):
-#   final third: end_x >= 200/3 (~66.67)   -- line 950
-#   penalty box: end_x >= 83 and 21.1 <= end_y <= 78.9  -- line 957
-# Box is a strict subset of the final third, so any chain reaching
-# the box necessarily also reached the final third.
-#
-# End-coordinate detection: a carry or pass that DELIVERS the ball
-# into a zone has end_x/end_y in the zone and start_x/start_y
-# outside -- so zone entry is an end-coordinate test, not a start
-# test. Same convention used elsewhere in this pipeline. The
-# original checked start_x/start_y, which missed every delivering
-# event (the event whose end_x first crossed x=83 wouldn't have
-# start_x in the box until the NEXT event, and "next event" may not
-# be in the same chain).
-#
-# Short-chain bias: progcarry_chains_df excludes possessionId == 0
-# (MIN_CHAIN_LEN = 2 in possession_chain.py). Consistent with the
-# rest of the pipeline.
-#
-# Simplification vs the original:
-#   - Original required a "final-third but NOT in box" event to flip
-#     `has_final_third` true, creating a detection gap for chains
-#     that jump directly from outside the final third into the box.
-#     Box is a subset of final third, so `reached_final_third` is
-#     simply "any event ends in final third."
-#   - Original walked events in temporal order and required the
-#     final-third event to precede the box entry. For real football
-#     geometry any chain reaching the box must have entered the
-#     final third first, so the temporal-order test is redundant.
-#   - Original used nested for-loops + iterrows. Vectorized groupby-
-#     any replaces it.
-#
-# NaN preservation: the np.where guard returns NaN when a team-game
-# has zero final-third possessions, and the final merge leaves
-# missing team-games as NaN so the downstream Z-score step treats
-# them as missing rather than as a real 0% box-entry team (which
-# would be a real extreme low value and bias both the league mean
-# and the team's Z-score downward).
-
-FINAL_THIRD = 200.0 / 3.0
-BOX_X = 83.0
-BOX_Y_MIN = 21.1
-BOX_Y_MAX = 78.9
-
-_ends_in_final_third = progcarry_chains_df["end_x"] >= FINAL_THIRD
-_ends_in_box = (
-    (progcarry_chains_df["end_x"] >= BOX_X)
-    & (progcarry_chains_df["end_y"] >= BOX_Y_MIN)
-    & (progcarry_chains_df["end_y"] <= BOX_Y_MAX)
-)
-
-_flags = pd.DataFrame(
-    {
-        "game_id": progcarry_chains_df["game_id"].values,
-        "team_id": progcarry_chains_df["team_id"].values,
-        "possessionId": progcarry_chains_df["possessionId"].values,
-        "ends_in_final_third": _ends_in_final_third.values,
-        "ends_in_box": _ends_in_box.values,
-    }
-)
-
-_chain_stats = (
-    _flags.groupby(
-        ["game_id", "team_id", "possessionId"], as_index=False
-    ).agg(
-        reached_final_third=("ends_in_final_third", "any"),
-        reached_box=("ends_in_box", "any"),
-    )
-)
-
-variable_df30 = (
-    _chain_stats.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        final_third_possessions=("reached_final_third", "sum"),
-        box_entries=("reached_box", "sum"),
-    )
-)
-
-variable_df30["final_third_to_box_entries_%"] = np.where(
-    variable_df30["final_third_possessions"] > 0,
-    variable_df30["box_entries"]
-    / variable_df30["final_third_possessions"]
-    * 100.0,
-    np.nan,
-)
-
-variable_df30 = variable_df30[
-    ["game_id", "team_id", "final_third_to_box_entries_%"]
-]
-
+# Definition: shared zone / 10 s tables built before # 6 (docs/variable_consistency_decisions.md D2, D4).
+variable_df30 = _chain_pct("reaches_box", CHAINS["reaches_third"] & ~CHAINS["starts_in_box"], "final_third_to_box_entries_%")
 variable_df30.head(100).to_csv("variable_df30.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -4019,34 +1811,31 @@ player's actions in advancing the ball and creating scoring opportunities."""
 # measures how much each action (pass, carry, dribble) contributes to
 # the team's chance of scoring, weighted by pitch location.
 #
-# The `xthreat` column lives on every progcarry_df row. Summing it per
-# (game_id, team_id) gives the team's total threat generation.
+# Summed per (game_id, team_id) is `xt_delta_cadeia`: the xT each
+# completed pass / take-on / carry adds over the team's previous
+# completed action in the same chain (plataforma-scouting). Unlike the
+# action xT, it does not re-count threat the team already had.
 #
-# Set-piece filter: corners (qualifier 6) and throw-ins (107) are
-# excluded -- these are restart-context deliveries that the underlying
-# xT model can rate as high-threat purely on coordinates (e.g. corner
-# delivered into the box) and would inflate teams that earn many of
-# them. Free kicks (5) and goal kicks (124) are KEPT because their
-# threat values reflect real in-play decision-making (where to launch,
-# whom to find). This policy is mirrored in xT_adversário.py so own-
-# team xT and conceded xT use the same convention.
+# Set-piece filter: corner (qualifier 6), throw-in (107) and goal kick
+# (124) passes are excluded, as plataforma-scouting does for pass xT
+# (XT_SET_PIECE_QUALIFIERS): restart deliveries are rated on
+# coordinates, not on in-play decision-making. Free kicks (5) stay. The
+# defensive-area opposition xT and variable_df24 use the same filter.
 #
 # NaN preservation: missing team-games left as NaN by the final merge
 # so the downstream Z-score step treats them as missing rather than as
 # a real 0-xT team (which would be a real extreme low value and bias
 # both the league mean and the team's Z-score downward).
 
-SET_PIECE_QUALIFIERS = (6, 107)
-
-_is_set_piece = progcarry_df["qualifiers"].apply(
-    lambda q: any(has_qualifier(q, qid) for qid in SET_PIECE_QUALIFIERS)
+_is_xt_set_piece_pass = (progcarry_df["type_id"] == 1) & progcarry_df["qualifiers"].apply(
+    lambda q: any(has_qualifier(q, qid) for qid in tc.XT_SET_PIECE_QUALIFIERS)
 )
 
 variable_df31 = (
-    progcarry_df.loc[~_is_set_piece]
-    .groupby(["game_id", "team_id"], as_index=False)["xthreat"]
+    progcarry_df.loc[~_is_xt_set_piece_pass]
+    .groupby(["game_id", "team_id"], as_index=False)["xt_delta_cadeia"]
     .sum()
-    .rename(columns={"xthreat": "xT"})
+    .rename(columns={"xt_delta_cadeia": "xT"})
 )
 
 variable_df31.head(100).to_csv("variable_df31.csv", index=True)
@@ -4066,38 +1855,11 @@ opponent's penalty area. This metric helps in understanding a team's activity in
 the most dangerous attacking zone on the pitch. It is an indicator of a team's ability to get into
 goal-scoring positions and create opportunities."""
 
-# Penalty Area Touches
-#
-# Per team per game, the number of times the team makes contact with
-# the ball inside the opponent's penalty area.
-#
-# Touch location = start_x / start_y (where the player contacts the
-# ball). End coordinates mark where the ball travels AFTER the touch,
-# so they are irrelevant for "touch IN the box."
-#
-# Penalty box (Opta F24 Appendix 11, reference/Opta-f24_appendices.md
-# line 957): x >= 83, 21.1 <= y <= 78.9.
-#
-# NaN preservation: missing team-games are left as NaN by the final
-# merge so the downstream Z-score step treats them as missing rather
-# than as a real 0-touches team (which would be a real extreme low
-# value and bias both the league mean and the team's Z-score downward).
-
-_touch_mask = progcarry_df["touch"] == True
-
-_in_box = (
-    (progcarry_df["start_x"] >= 83.0)
-    & (progcarry_df["start_y"] >= 21.1)
-    & (progcarry_df["start_y"] <= 78.9)
-)
-
+# Penalty-area touches (D9): reference `possession_touch` starting inside the box.
 variable_df32 = (
-    progcarry_df.loc[_touch_mask & _in_box]
-    .groupby(["game_id", "team_id"], as_index=False)
-    .size()
-    .rename(columns={"size": "penalty_area_touches"})
+    progcarry_df[tc.possession_touch(progcarry_df) & tc.in_box(progcarry_df["start_x"], progcarry_df["start_y"])]
+    .groupby(["game_id", "team_id"]).size().rename("penalty_area_touches").reset_index()
 )
-
 variable_df32.head(100).to_csv("variable_df32.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -4115,79 +1877,8 @@ area (box) results in a shot. This metric helps in understanding the efficiency 
 a team's ability to convert box entries into shooting opportunities. It indicates how
 often penetrating the box leads to an attempt on goal."""
 
-# Box Entries to Shot %
-#
-# Per team per game, the percentage of possession chains that enter the
-# opponent's penalty box and also produce a shot. Measures how
-# efficiently a team converts box entries into shooting opportunities.
-#
-# Box entry detection: end_x / end_y in the penalty box — the event
-# that DELIVERS the ball into the box, not the one that starts there.
-# Same convention as variable_df30 (entradas_área(%).py).
-#
-# Shot detection: shot == True column on progcarry_chains_df.
-#
-# Penalty box (Opta F24 Appendix 11, reference/Opta-f24_appendices.md
-# line 957): x >= 83, 21.1 <= y <= 78.9.
-#
-# Short-chain bias: progcarry_chains_df excludes possessionId == 0
-# (MIN_CHAIN_LEN = 2 in possession_chain.py). Consistent with the
-# rest of the pipeline.
-#
-# NaN preservation: the np.where guard returns NaN when a team-game
-# has zero box entries, and the final merge leaves missing team-games
-# as NaN so the downstream Z-score step treats them as missing rather
-# than as a real 0% box-conversion team (which would be a real extreme
-# low value and bias both the league mean and the team's Z-score
-# downward).
-
-BOX_X = 83.0
-BOX_Y_MIN = 21.1
-BOX_Y_MAX = 78.9
-
-_ends_in_box = (
-    (progcarry_chains_df["end_x"] >= BOX_X)
-    & (progcarry_chains_df["end_y"] >= BOX_Y_MIN)
-    & (progcarry_chains_df["end_y"] <= BOX_Y_MAX)
-)
-
-_is_shot = progcarry_chains_df["shot"] == True
-
-_chain_flags = (
-    pd.DataFrame(
-        {
-            "game_id": progcarry_chains_df["game_id"].values,
-            "team_id": progcarry_chains_df["team_id"].values,
-            "possessionId": progcarry_chains_df["possessionId"].values,
-            "ends_in_box": _ends_in_box.values,
-            "is_shot": _is_shot.values,
-        }
-    )
-    .groupby(["game_id", "team_id", "possessionId"], as_index=False)
-    .agg(
-        reached_box=("ends_in_box", "any"),
-        has_shot=("is_shot", "any"),
-    )
-)
-
-_box_chains = _chain_flags.loc[_chain_flags["reached_box"]]
-
-variable_df33 = (
-    _box_chains.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        box_entries=("reached_box", "sum"),
-        entries_with_shot=("has_shot", "sum"),
-    )
-)
-
-variable_df33["box_entries_to_shot_%"] = np.where(
-    variable_df33["box_entries"] > 0,
-    variable_df33["entries_with_shot"] / variable_df33["box_entries"] * 100.0,
-    np.nan,
-)
-
-variable_df33 = variable_df33[["game_id", "team_id", "box_entries_to_shot_%"]]
-
+# Definition: shared zone / 10 s tables built before # 6 (docs/variable_consistency_decisions.md D2, D4).
+variable_df33 = _chain_pct("has_shot", CHAINS["reaches_box"] & ~CHAINS["starts_in_box"], "box_entries_to_shot_%")
 variable_df33.head(100).to_csv("variable_df33.csv", index=True)
 
 variable_df = variable_df.merge(
@@ -4219,24 +1910,13 @@ goalscoring opportunities from open play and set pieces other than penalties."""
 # than as a real 0-shots team (which would be a real extreme low value
 # and bias both the league mean and the team's Z-score downward).
 
-_is_penalty = progcarry_df["qualifiers"].apply(lambda q: has_qualifier(q, 9))
-
-_np_shot_mask = (progcarry_df["shot"] == True) & ~_is_penalty
-
+# Non-penalty shots: types 13–16 without penalties (q9) and own goals (q28) — reference `npxg_shots` (B1).
 variable_df34 = (
-    progcarry_df.loc[_np_shot_mask]
-    .groupby(["game_id", "team_id"], as_index=False)
-    .size()
-    .rename(columns={"size": "np_shots"})
+    progcarry_df[tc.npxg_shots(progcarry_df)]
+    .groupby(["game_id", "team_id"]).size().rename("np_shots").reset_index()
 )
-
 variable_df34.head(100).to_csv("variable_df34.csv", index=True)
-
-variable_df = variable_df.merge(
-    variable_df34[["game_id", "team_id", "np_shots"]],
-    on=["game_id", "team_id"],
-    how="left",
-)
+variable_df = variable_df.merge(variable_df34[["game_id", "team_id", "np_shots"]], on=["game_id", "team_id"], how="left")
 
 ###############################################################################
 ###############################################################################
@@ -4313,16 +1993,6 @@ or team is expected to score based on the quality of their non-penalty shot oppo
 # than as a real 0-xG team (which would be a real extreme low value
 # and bias both the league mean and the team's Z-score downward).
 
-if "xG" not in progcarry_df.columns:
-    progcarry_df = progcarry_df.merge(
-        xg_df[["game_id", "event_id", "xG"]],
-        on=["game_id", "event_id"],
-        how="left",
-    )
-    progcarry_df["xG"] = progcarry_df["xG"].fillna(0.0)
-    if (progcarry_df["xG"] != 0).sum() == 0:
-        raise RuntimeError("xG merge produced all-zero xG column — event_id key space drift between xg_df and progcarry_df")
-
 SHOT_TYPES = [13, 14, 15, 16]
 
 _shots = progcarry_df[progcarry_df["type_id"].isin(SHOT_TYPES)].copy()
@@ -4375,26 +2045,13 @@ open play and set pieces other than penalties."""
 # collapse those into one extreme low value and bias both the league
 # mean and the team's Z-score downward.
 
-_goals = progcarry_df[progcarry_df["type_id"] == 16].copy()
-
-_is_penalty = _goals["qualifiers"].apply(lambda q: has_qualifier(q, 9))
-
-_np_goals = _goals[~_is_penalty]
-
+# Non-penalty goals: type 16, not q9, not an own goal (reference `non_penalty_goals_mask`, B1).
 variable_df37 = (
-    _np_goals
-    .groupby(["game_id", "team_id"], as_index=False)
-    .size()
-    .rename(columns={"size": "np_goals"})
+    progcarry_df[(progcarry_df["type_id"] == 16) & ~progcarry_df["q9"] & ~progcarry_df["q28"]]
+    .groupby(["game_id", "team_id"]).size().rename("np_goals").reset_index()
 )
-
 variable_df37.head(100).to_csv("variable_df37.csv", index=True)
-
-variable_df = variable_df.merge(
-    variable_df37[["game_id", "team_id", "np_goals"]],
-    on=["game_id", "team_id"],
-    how="left",
-)
+variable_df = variable_df.merge(variable_df37[["game_id", "team_id", "np_goals"]], on=["game_id", "team_id"], how="left")
 
 ###############################################################################
 ###############################################################################
@@ -4426,61 +2083,21 @@ provides insight into the efficiency and danger of a team's shooting opportuniti
 # realistic value and bias both the league mean and the team's Z-score
 # downward).
 
-if "xG" not in progcarry_df.columns:
-    progcarry_df = progcarry_df.merge(
-        xg_df[["game_id", "event_id", "xG"]],
-        on=["game_id", "event_id"],
-        how="left",
-    )
-    progcarry_df["xG"] = progcarry_df["xG"].fillna(0.0)
-    if (progcarry_df["xG"] != 0).sum() == 0:
-        raise RuntimeError("xG merge produced all-zero xG column — event_id key space drift between xg_df and progcarry_df")
-
-SHOT_TYPES = [13, 14, 15, 16]
-
-_shots = progcarry_df[progcarry_df["type_id"].isin(SHOT_TYPES)].copy()
-
-_is_penalty = _shots["qualifiers"].apply(lambda q: has_qualifier(q, 9))
-
-_np_shots = _shots[~_is_penalty]
-
-_agg = _np_shots.groupby(["game_id", "team_id"], as_index=False).agg(
-    total_np_xg=("xG", "sum"),
-    np_shot_count=("xG", "size"),
-)
-
-_agg["xg_per_shot"] = _agg["total_np_xg"] / _agg["np_shot_count"]
-
-variable_df38 = _agg[["game_id", "team_id", "xg_per_shot"]]
-
+# np xG per np shot; own goals are not shots of the team (B1). NaN when the team has no np shot.
+_s38 = progcarry_df[tc.npxg_shots(progcarry_df)]
+variable_df38 = _s38.groupby(["game_id", "team_id"])["xG"].mean().rename("xg_per_shot").reset_index()
 variable_df38.head(100).to_csv("variable_df38.csv", index=True)
-
-variable_df = variable_df.merge(
-    variable_df38[["game_id", "team_id", "xg_per_shot"]],
-    on=["game_id", "team_id"],
-    how="left",
-)
+variable_df = variable_df.merge(variable_df38[["game_id", "team_id", "xg_per_shot"]], on=["game_id", "team_id"], how="left")
 
 ###############################################################################
 ###############################################################################
 # Variáveis
 # 39
-#Ball-in-play minutes
-"""Ball-in-play minutes refer to the total amount of time during a match when the ball is actively in
-play. This excludes any stoppages such as injuries, substitutions, fouls, and other interruptions. It
-measures the actual duration of active gameplay."""
-
-# Ball-in-Play Minutes
-#
-# Per team per game, the total time the ball was actively in play
-# during that team's possession chains, converted to minutes.
-# Excludes stoppages (injuries, substitutions, fouls, etc.).
-#
-# Chain duration is derived from progcarry_chains_df as max(time) -
-# min(time) per chain, consistent with the possession dataframe and
-# pass tempo calculations earlier in the pipeline.
-#
-# NaN -> 0: teams with no recorded possession get 0 minutes.
+#In-possession ball-in-play minutes
+"""In-possession ball-in-play minutes (D10): per team per game, the summed duration of the team's own possession
+chains (last event time - first event time of each chain), in minutes. It counts chain time only — the gaps between
+chains (restarts, stoppages, transitions) are not counted — so both teams together add up to less than the match's
+real ball-in-play time. It is possession in minutes rather than %, so it is not used in any composite."""
 
 _chain_time_39 = progcarry_chains_df["minute"] * 60 + progcarry_chains_df["second"]
 _chain_durations_39 = (
@@ -4507,18 +2124,6 @@ variable_df = variable_df.merge(
     on=["game_id", "team_id"],
     how="left",
 )
-variable_df["ball_in_play"] = variable_df["ball_in_play"].fillna(0)
-
-###############################################################################
-###############################################################################
-# Variáveis
-# 40
-#Field tilt %
-"""Field tilt % refers to the percentage of time the ball is in the attacking half of the field 
-for a particular team compared to their opponent. This metric helps in understanding which team 
-is more dominant in terms of territorial control and attacking pressure during a match."""
-
-#Calculated in variable_df26
 
 ###############################################################################
 ###############################################################################
@@ -4543,16 +2148,6 @@ than traditional metrics like shots or goals."""
 # xG values come from xg_df, merged into df beforehand.
 #
 # NaN -> 0: teams with no shots get 0 total_xg.
-
-if "xG" not in progcarry_df.columns:
-    progcarry_df = progcarry_df.merge(
-        xg_df[["game_id", "event_id", "xG"]],
-        on=["game_id", "event_id"],
-        how="left",
-    )
-    progcarry_df["xG"] = progcarry_df["xG"].fillna(0.0)
-    if (progcarry_df["xG"] != 0).sum() == 0:
-        raise RuntimeError("xG merge produced all-zero xG column — event_id key space drift between xg_df and progcarry_df")
 
 SHOT_TYPES = [13, 14, 15, 16]
 
@@ -4587,45 +2182,27 @@ same number of points."""
 # Goal Difference
 #
 # Per team per game, goals scored minus goals conceded.
-# Uses the boolean "goal" column which flags goal events.
+# Goals are type-16 events; an own goal (q28) is credited to the opponent (B1).
 # Goals conceded = goals scored by the opponent in the same game.
 #
 # NaN -> 0: teams with no goal events on either side get 0.
 
-# Start from all (game_id, team_id) pairs so teams with 0 goals are included.
-_all_teams = progcarry_df[["game_id", "team_id"]].drop_duplicates()
-
-_goals_per_team = (
-    progcarry_df[progcarry_df["goal"] == True]
-    .groupby(["game_id", "team_id"], as_index=False)
-    .size()
-    .rename(columns={"size": "goals_scored"})
+# Goals credited per team: an own goal (q28) is logged on the conceding team and counts for the opponent (B1).
+_goals = progcarry_df[progcarry_df["type_id"] == 16]
+_goals_for = (
+    _goals.assign(team_id=tc.goal_team(_goals, GAME_TEAMS).astype(progcarry_df["team_id"].dtype))
+    .groupby(["game_id", "team_id"]).size().rename("goals_scored").reset_index()
 )
+_goals_table = GAME_TEAMS.merge(_goals_for, on=["game_id", "team_id"], how="left").fillna({"goals_scored": 0})
+_goals_table = _goals_table.merge(
+    tc.to_opponent(_goals_table[["game_id", "team_id", "goals_scored"]], GAME_TEAMS)
+      .rename(columns={"goals_scored": "goals_conceded"}),
+    on=["game_id", "team_id"], how="left")
+_goals_table["goal_difference"] = _goals_table["goals_scored"] - _goals_table["goals_conceded"]
 
-# Left merge ensures teams with 0 goals get goals_scored = 0.
-_merged = _all_teams.merge(_goals_per_team, on=["game_id", "team_id"], how="left")
-_merged["goals_scored"] = _merged["goals_scored"].fillna(0).astype(int)
-
-_goals_per_game = (
-    _merged
-    .groupby("game_id", as_index=False)["goals_scored"]
-    .sum()
-    .rename(columns={"goals_scored": "game_total_goals"})
-)
-
-_merged = _merged.merge(_goals_per_game, on="game_id", how="left")
-_merged["goals_conceded"] = _merged["game_total_goals"] - _merged["goals_scored"]
-_merged["goal_difference"] = _merged["goals_scored"] - _merged["goals_conceded"]
-
-variable_df45 = _merged[["game_id", "team_id", "goal_difference"]]
-
+variable_df45 = _goals_table[["game_id", "team_id", "goal_difference"]]
 variable_df45.head(100).to_csv("variable_df45.csv", index=True)
-
-variable_df = variable_df.merge(
-    variable_df45[["game_id", "team_id", "goal_difference"]],
-    on=["game_id", "team_id"],
-    how="left",
-)
+variable_df = variable_df.merge(variable_df45, on=["game_id", "team_id"], how="left")
 variable_df["goal_difference"] = variable_df["goal_difference"].fillna(0)
 
 ###############################################################################
@@ -4644,42 +2221,13 @@ opposition from scoring."""
 # Measures defensive performance — how many goals a team concedes.
 #
 # Computed as: total goals in the game minus the team's own goals.
-# Uses the boolean "goal" column which flags goal events.
+# Goals are type-16 events; an own goal (q28) is credited to the opponent (B1).
 #
 # NaN -> 0: teams in goalless draws get 0.
 
-# Start from all (game_id, team_id) pairs so teams with 0 goals are included.
-_all_teams_46 = progcarry_df[["game_id", "team_id"]].drop_duplicates()
-
-_goals_per_team = (
-    progcarry_df[progcarry_df["goal"] == True]
-    .groupby(["game_id", "team_id"], as_index=False)
-    .size()
-    .rename(columns={"size": "goals_scored"})
-)
-
-_merged = _all_teams_46.merge(_goals_per_team, on=["game_id", "team_id"], how="left")
-_merged["goals_scored"] = _merged["goals_scored"].fillna(0).astype(int)
-
-_goals_per_game = (
-    _merged
-    .groupby("game_id", as_index=False)["goals_scored"]
-    .sum()
-    .rename(columns={"goals_scored": "game_total_goals"})
-)
-
-_merged = _merged.merge(_goals_per_game, on="game_id", how="left")
-_merged["goals_conceded"] = _merged["game_total_goals"] - _merged["goals_scored"]
-
-variable_df46 = _merged[["game_id", "team_id", "goals_conceded"]]
-
+variable_df46 = _goals_table[["game_id", "team_id", "goals_conceded"]]
 variable_df46.head(100).to_csv("variable_df46.csv", index=True)
-
-variable_df = variable_df.merge(
-    variable_df46[["game_id", "team_id", "goals_conceded"]],
-    on=["game_id", "team_id"],
-    how="left",
-)
+variable_df = variable_df.merge(variable_df46, on=["game_id", "team_id"], how="left")
 variable_df["goals_conceded"] = variable_df["goals_conceded"].fillna(0)
 
 ###############################################################################
@@ -4695,24 +2243,13 @@ the outcome of matches and contribute to the team's overall success."""
 # Goals Scored
 #
 # Per team per game, the total number of goals scored.
-# Uses the boolean "goal" column which flags goal events.
+# Goals are type-16 events; an own goal (q28) is credited to the opponent (B1).
 #
 # NaN -> 0: teams that did not score get 0.
 
-variable_df47 = (
-    progcarry_df[progcarry_df["goal"] == True]
-    .groupby(["game_id", "team_id"], as_index=False)
-    .size()
-    .rename(columns={"size": "goals_scored"})
-)
-
+variable_df47 = _goals_table[["game_id", "team_id", "goals_scored"]]
 variable_df47.head(100).to_csv("variable_df47.csv", index=True)
-
-variable_df = variable_df.merge(
-    variable_df47[["game_id", "team_id", "goals_scored"]],
-    on=["game_id", "team_id"],
-    how="left",
-)
+variable_df = variable_df.merge(variable_df47, on=["game_id", "team_id"], how="left")
 variable_df["goals_scored"] = variable_df["goals_scored"].fillna(0)
 
 
@@ -4733,9 +2270,13 @@ variable_df["goals_scored"] = variable_df["goals_scored"].fillna(0)
 variable_df.to_csv("variable_df_new.csv")
 variable_df_new = variable_df.copy()
 
-# Since all NaN are actually zeros...
-# 1. Replace all NaN with 0 (since you confirmed NaN means zero in your data)
-variable_df_new = variable_df_new.fillna(0)
+# D11: no events -> 0 for counts and sums; ratios, heights and times keep NaN (no denominator = undefined).
+COUNT_COLUMNS = ["defensive_intensity", "high_turnovers", "recoveries", "retained_possessions_5s",
+                 "final_third_entries_10s", "box_entries_10s", "xG_10s", "xT_10s",
+                 "opposition_final_third_entries_10s", "opposition_box_entries_10s", "opposition_xG_10s", "xT",
+                 "penalty_area_touches", "np_shots", "high_opportunity_shots", "np_xg", "np_goals", "total_xg",
+                 "goal_difference", "goals_conceded", "goals_scored", "ball_in_play"]
+variable_df_new[COUNT_COLUMNS] = variable_df_new[COUNT_COLUMNS].fillna(0)
 
 # Add place 
 # Assign "home" or "away" to the "place" column in oponnent_analysis
@@ -4773,108 +2314,9 @@ variable_df_new = variable_df_new[columns]
 ############################################################################################
 ############################################################################################
 
-# Adjusting for Possession
-# List of variables to be adjusted for opponent possession
-# List of variables to be adjusted for team possession
-# Drop the xg_shot_y column
-
-#variable_df2.to_csv = ("variable_df2.csv")
-
-columns_opp_pos = [
-    "defensive_intensity", "recoveries"
-    ]
-
-columns_team_pos = [
-    "high_turnovers"]
-
-
-
-############################################################################################
-############################################################################################
-# Adjusting variable_df_adj columns
-# Normalizing by opposition possession:
-def normalize_opponent_possession_stats(df, columns_to_normalize):
-    """
-    Normalize defensive statistics by opponent possession and scale by 50
-    
-    Parameters:
-    df: DataFrame with defensive statistics
-    columns_to_normalize: List of columns to normalize
-    
-    Returns:
-    DataFrame with normalized statistics
-    """
-    # Create copy to avoid modifying original
-    df_normalized = df.copy()
-    
-    try:
-        # First, check if all columns exist in the dataframe
-        existing_columns = [col for col in columns_to_normalize if col in df_normalized.columns]
-        
-        if len(existing_columns) != len(columns_to_normalize):
-            missing_columns = set(columns_to_normalize) - set(existing_columns)
-            print(f"Warning: Some columns do not exist in the dataframe: {missing_columns}")
-        
-        if len(existing_columns) == 0:
-            print("No valid columns to normalize. Returning original dataframe.")
-            return df_normalized
-        
-        # Avoid division by zero by replacing 0s with NaN
-        opponent_possession = df_normalized["opponent_possession"].replace(0, np.nan)
-        
-        # Apply normalization column by column to avoid alignment issues
-        for col in existing_columns:
-            df_normalized[col] = (df_normalized[col] / opponent_possession) * 50
-        
-        # Replace any resulting infinite values with NaN
-        df_normalized[existing_columns] = df_normalized[existing_columns].replace([np.inf, -np.inf], np.nan)
-        
-        return df_normalized
-        
-    except Exception as e:
-        print(f"Error during normalization: {str(e)}")
-        return df
-    
-# Normalizing by team possession:
-
-def normalize_team_possession_stats(df, columns_to_normalize):
-    """
-    Normalize offensive statistics by team possession and scale by 50
-    
-    Parameters:
-    df: DataFrame with team statistics
-    columns_to_normalize: List of columns to normalize
-    
-    Returns:
-    DataFrame with normalized statistics
-    """
-    # Create copy to avoid modifying original
-    df_normalized = df.copy()
-    
-    try:
-        # Avoid division by zero by replacing 0s with NaN
-        team_possession = df_normalized["possession"].replace(0, np.nan)
-        
-        # Apply transformation
-        df_normalized[columns_to_normalize] = (
-            df_normalized[columns_to_normalize]
-            .divide(team_possession, axis=0)
-            .multiply(50)
-        )
-        
-        # Replace any resulting infinite values with NaN
-        df_normalized[columns_to_normalize] = df_normalized[columns_to_normalize].replace([np.inf, -np.inf], np.nan)
-        
-        return df_normalized
-        
-    except Exception as e:
-        print(f"Error during normalization: {str(e)}")
-        return df
-
-
-# Transform the data
-variable_df_new = normalize_opponent_possession_stats(variable_df_new, columns_opp_pos)
-variable_df_new = normalize_team_possession_stats(variable_df_new, columns_team_pos)
+# No possession adjustment. Raw defensive_intensity and recoveries barely move with opponent possession (r +0.06,
+# -0.17) and high_turnovers already falls as own possession rises (r -0.54); dividing by possession turned all three
+# into possession proxies (r -0.83) and pulled four performance composites toward possession. They stay raw counts.
 
 ###########################################################################
 ###########################################################################
@@ -4926,7 +2368,7 @@ for team_id, group in variable_df_new.groupby("team_id"):
     # Repeat columns [0:15]
     base_columns = group.iloc[:, :10].copy()
     # Apply z-score transformation to columns [11:] and rename with '_z' suffix
-    zscore_columns = group.iloc[:, 10:].apply(zscore)
+    zscore_columns = group.iloc[:, 10:].apply(lambda s: zscore(s, nan_policy="omit"))
     zscore_columns.rename(columns=lambda col: f"{col}_z", inplace=True)
     # Combine the repeated columns with the z-score transformed columns
     função_z = pd.concat([base_columns, zscore_columns], axis=1)
@@ -4965,8 +2407,8 @@ variable_df_z_team["goals_conceded_z"] = -1*variable_df_z_team["goals_conceded_z
 
 
 # Drop weak/ambiguous contributors
-defence_metrics_outcome = ["Opposition_xT_z", "opposition_progression_percentage_z", 
-                   "opp_final_third_to_box_%_z"]
+# Opposition_xT is out: it did not agree with the other defence items (item-rest r +0.07).
+defence_metrics_outcome = ["opposition_progression_percentage_z", "opp_final_third_to_box_%_z"]
 defence_metrics_process = ["PPDA_z", "defensive_intensity_z", "defensive_height_z"]
 
 # Weighed mean:
@@ -5011,8 +2453,8 @@ chance_creation_volume = ["penalty_area_touches_z", "np_shots_z",
                    "high_opportunity_shots_z", "np_xg_z"]
 
 # Quality and outcome
-chance_creation_quality_outcome = ["xg_per_shot_z", "np_goals_z", 
-                            "box_entries_to_shot_%_z"]
+# box_entries_to_shot_% is out: it did not agree with the other chance-creation items (item-rest r +0.25).
+chance_creation_quality_outcome = ["xg_per_shot_z", "np_goals_z"]
 
 chance_creation_metrics = 0.7 * variable_df_z_team[chance_creation_volume].mean(axis=1) + 0.3 * variable_df_z_team[chance_creation_quality_outcome].mean(axis=1)
 
@@ -5050,7 +2492,7 @@ variable_df_z_team = variable_df_z_team[cols]
 
 # Renaming columns
 columns_to_rename = ["round", "game_id", "date", "fixture", "team_id", "team_name",
-                     "possession_z", "opponent_possession_z", "defence_z", "defensive_transition_z",
+                     "defence_z", "defensive_transition_z",
                      "attacking_transition_z", "attacking_z", "chance_creation_z", "PPDA_z",
                      "defensive_intensity_z",
                      "defensive_duels_won_%_z", "defensive_height_z", "opposition_pass_tempo_z",
@@ -5068,8 +2510,8 @@ columns_to_rename = ["round", "game_id", "date", "fixture", "team_id", "team_nam
                      "goal_difference_z", "goals_conceded_z", "goals_scored_z"
                      ]
 
-columns_renamed = ["rodada", "game_id", "data", "partida", "team_id", "clube", "Posse (%)",
-                   "Posse adversário (%)", "Defesa", "Transição defensiva",
+columns_renamed = ["rodada", "game_id", "data", "partida", "team_id", "clube",
+                   "Defesa", "Transição defensiva",
                    "Transição ofensiva", "Ataque", "Criação de chances",
                    "PPDA", "Intensidade defensiva", "Duelos defensivos vencidos (%)",
                    "Altura defensiva (m)", "Velocidade do passe adversário","Entradas do adversário no último terço (%)",
@@ -5120,7 +2562,7 @@ for round, group in variable_df_new.groupby("round"):
     # Repeat columns [0:15]
     base_columns = group.iloc[:, :10].copy()
     # Apply z-score transformation to columns [7:] and rename with '_z' suffix
-    zscore_columns = group.iloc[:, 10:].apply(zscore)
+    zscore_columns = group.iloc[:, 10:].apply(lambda s: zscore(s, nan_policy="omit"))
     zscore_columns.rename(columns=lambda col: f"{col}_z", inplace=True)
     # Combine the repeated columns with the z-score transformed columns
     função_z = pd.concat([base_columns, zscore_columns], axis=1)
@@ -5160,8 +2602,8 @@ variable_df_z_round["goals_conceded_z"] = -1*variable_df_z_round["goals_conceded
 
 
 # Drop weak/ambiguous contributors
-defence_metrics_outcome = ["Opposition_xT_z", "opposition_progression_percentage_z", 
-                   "opp_final_third_to_box_%_z"]
+# Opposition_xT is out: it did not agree with the other defence items (item-rest r +0.07).
+defence_metrics_outcome = ["opposition_progression_percentage_z", "opp_final_third_to_box_%_z"]
 defence_metrics_process = ["PPDA_z", "defensive_intensity_z", "defensive_height_z"]
 
 # Weighed mean:
@@ -5206,8 +2648,8 @@ chance_creation_volume = ["penalty_area_touches_z", "np_shots_z",
                    "high_opportunity_shots_z", "np_xg_z"]
 
 # Quality and outcome
-chance_creation_quality_outcome = ["xg_per_shot_z", "np_goals_z", 
-                            "box_entries_to_shot_%_z"]
+# box_entries_to_shot_% is out: it did not agree with the other chance-creation items (item-rest r +0.25).
+chance_creation_quality_outcome = ["xg_per_shot_z", "np_goals_z"]
 
 chance_creation_metrics = 0.7 * variable_df_z_round[chance_creation_volume].mean(axis=1) + 0.3 * variable_df_z_round[chance_creation_quality_outcome].mean(axis=1)
 
@@ -5247,7 +2689,7 @@ variable_df_z_round = variable_df_z_round[cols]
 
 # Renaming columns
 columns_to_rename = ["round", "game_id", "date", "fixture", "team_id", "team_name",
-                     "possession_z", "opponent_possession_z", "defence_z", "defensive_transition_z",
+                     "defence_z", "defensive_transition_z",
                      "attacking_transition_z", "attacking_z", "chance_creation_z", "PPDA_z",
                      "defensive_intensity_z",
                      "defensive_duels_won_%_z", "defensive_height_z", "opposition_pass_tempo_z",
@@ -5265,8 +2707,8 @@ columns_to_rename = ["round", "game_id", "date", "fixture", "team_id", "team_nam
                      "goal_difference_z", "goals_conceded_z", "goals_scored_z"
                      ]
 
-columns_renamed = ["rodada", "game_id", "data", "partida", "team_id", "clube", "Posse (%)",
-                   "Posse adversário (%)", "Defesa", "Transição defensiva",
+columns_renamed = ["rodada", "game_id", "data", "partida", "team_id", "clube",
+                   "Defesa", "Transição defensiva",
                    "Transição ofensiva", "Ataque", "Criação de chances",
                    "PPDA", "Intensidade defensiva", "Duelos defensivos vencidos (%)",
                    "Altura defensiva (m)", "Velocidade do passe adversário","Entradas do adversário no último terço (%)",
@@ -5337,112 +2779,6 @@ oponnent_analysis['place'] = oponnent_analysis.apply(determine_place, axis=1)
 oponnent_analysis.to_csv("oponnent_analysis.csv", index=False)
 """
 
-#Creating performance_metrics_2
-
-performance_metrics_2 = pd.read_csv("performance_metrics.csv")
-
-# Creating qualities columns
-# Define the columns to average for each metric
-defence_metrics = ["PPDA", "defensive_intensity", "defensive_duels_won_%",
-                   "defensive_height", "opposition_pass_tempo",	
-                   "opposition_progression_percentage", "opp_final_third_to_box_%",	
-                   "Opposition_xT"]
-
-defensive_transition_metrics = ["high_turnovers", "turnover_line_height", "recoveries_within_5s_%", 
-                                "avg_time_to_defensive_action", "opposition_final_third_entries_10s", 
-                                "opposition_box_entries_10s", "opposition_xG_10s"]
-
-attacking_transition_metrics = ["recoveries",	"recovery_height", "retained_possessions_5s",
-                                "retained_possessions_5s_%", "final_third_entries_10s",
-                                "box_entries_10s", "xG_10s", "xT_10s"]
-
-attacking_metrics = ["field_tilt_%",	"long_ball_%", "pass_tempo", 
-                  "final_third_entries_%", "final_third_to_box_entries_%", "xT"]
-
-chance_creation_metrics = ["penalty_area_touches", "box_entries_to_shot_%", "np_shots", 
-                           "high_opportunity_shots", "np_xg", "np_goals", "xg_per_shot"]
-
-# Compute the arithmetic mean for each metric and assign to the respective column
-performance_metrics_2["defence"] = performance_metrics_2[defence_metrics].mean(axis=1)
-performance_metrics_2["defensive_transition"] = performance_metrics_2[defensive_transition_metrics].mean(axis=1)
-performance_metrics_2["attacking_transition"] = performance_metrics_2[attacking_transition_metrics].mean(axis=1)
-performance_metrics_2["attacking"] = performance_metrics_2[attacking_metrics].mean(axis=1)
-performance_metrics_2["chance_creation"] = performance_metrics_2[chance_creation_metrics].mean(axis=1)
-
-# Get a list of the current columns
-cols = list(performance_metrics_2.columns)
-
-# List of columns to be relocated
-cols_to_remove = ["defence", "defensive_transition", "attacking_transition", 
-                  "attacking", "chance_creation"]
-
-# Remove these columns from the list
-for col in cols_to_remove:
-    cols.remove(col)
-
-# Insert the columns in the desired order at index 9, adjusting the index as we go
-for i, col in enumerate(cols_to_remove):
-    cols.insert(10 + i, col)
-
-# Reorder the dataframe columns accordingly
-performance_metrics_2 = performance_metrics_2[cols]
-
-# Renaming columns
-columns_to_rename = ["round", "game_id", "date", "fixture", "team_id", "team_name",
-                     "possession", "opponent_possession", "defence", "defensive_transition",
-                     "attacking_transition", "attacking", "chance_creation", "PPDA",
-                     "defensive_intensity",
-                     "defensive_duels_won_%", "defensive_height", "opposition_pass_tempo",
-                     "opposition_progression_percentage", "opp_final_third_to_box_%",
-                     "Opposition_xT", "high_turnovers", "turnover_line_height",
-                     "recoveries_within_5s_%", "avg_time_to_defensive_action",
-                     "avg_recovery_time",
-                     "opposition_final_third_entries_10s", "opposition_box_entries_10s",
-                     "opposition_xG_10s", "recoveries", "recovery_height", "retained_possessions_5s",
-                     "retained_possessions_5s_%", "final_third_entries_10s", "box_entries_10s", 
-                     "xG_10s", "xT_10s", "field_tilt_%", "long_ball_%", "pass_tempo",
-                     "final_third_entries_%", "final_third_to_box_entries_%", "xT", "penalty_area_touches",
-                     "box_entries_to_shot_%", "np_shots", "high_opportunity_shots", "np_xg", "np_goals",
-                     "xg_per_shot", "ball_in_play", "total_xg",
-                     "goal_difference", "goals_conceded", "goals_scored"
-                     ]
-
-columns_renamed = ["rodada", "game_id", "data", "partida", "team_id", "clube", "Posse (%)",
-                   "Posse adversário (%)", "Defesa", "Transição defensiva",
-                   "Transição ofensiva", "Ataque", "Criação de chances",
-                   "PPDA", "Intensidade defensiva", "Duelos defensivos vencidos (%)",
-                   "Altura defensiva (m)", "Velocidade do passe adversário","Entradas do adversário no último terço (%)",
-                   "Entradas do adversário na área (%)", "xT adversário","Perdas de posse na linha baixa",
-                   "Altura da perda de posse (m)", "Recuperações de posse em 5s (%)", "Tempo médio ação defensiva (s)", 
-                   "Tempo médio para recuperação de posse",
-                   "Entradas do adversário no último terço em 10s da recuperação da posse",
-                   "Entradas do adversário na área em 10s da recuperação da posse", 
-                   "xG do adversário em 10s da recuperação da posse", "Recuperações de posse", 
-                   "Altura da recuperação de posse (m)", "Posse mantida em 5s", "Posse mantida em 5s (%)",
-                   "Entradas no último terço em 10s", "Entradas na área em 10s", "xG em 10s da recuperação da posse",
-                   "xT em 10s da recuperação da posse", "Field tilt (%)", "Bola longa (%)", 
-                   "Velocidade do passe", "Entradas no último terço (%)", "Entradas na área (%)",
-                   "xT (Ameaça esperada)", "Toques na área", "Finalizações (pEntrada na área, %)",
-                   "Finalizações (exceto pênaltis)", "Grandes oportunidades", "xG (exceto pênaltis)",
-                   "Gols (exceto pênaltis)", "xG (pFinalização)", "Bola em jogo (minutos)",
-                   "xG (Total)", "Diferença de gols",
-                    "Gols sofridos", "Gols marcados"
-                    ]
-
-# Create a dictionary mapping old names to new names
-rename_dict = dict(zip(columns_to_rename, columns_renamed))
-
-# Rename columns in performance_metrics_2
-performance_metrics_2 = performance_metrics_2.rename(columns=rename_dict)
-
-# Sort the dataframe by 'game_id' and reset the index
-performance_metrics_2 = performance_metrics_2.sort_values(['rodada', 'data'], ascending=[False, False]).reset_index(drop=True)
-
-# Assumindo que performance_metrics_2 já é um DataFrame
-performance_metrics_2 = performance_metrics_2.drop(performance_metrics_2.columns[0], axis=1)
-
-#Making a csv file
-performance_metrics_2.to_csv("performance_metrics_2.csv")
 
 ###########################################################
 ###########################################################
@@ -5453,7 +2789,7 @@ performance_metrics_2.to_csv("performance_metrics_2.csv")
 ###########################################################
 ###########################################################
 
-# Início da Consrução das Variáveis de Estilo de Jogo
+# Início da Construção das Variáveis de Estilo de Jogo
 # Variáveis de Play Style
 # DEFENCE
 # 1
@@ -5473,46 +2809,9 @@ team engages in defensive activities."""
 # therefore a percentage, not meters — it must be scaled by the physical
 # pitch length to produce meters.
 #
-# Defensive action set (per task definition):
-#   - type_id 4  (Foul)         outcome == 0  # foul committed by defender
-#                                             #   (WhoScored convention: 0=committed)
-#   - type_id 7  (Tackle)       any outcome
-#   - type_id 8  (Interception)
-#   - type_id 12 (Clearance)
-#   - type_id 44 (Aerial duel)
-#   - type_id 45 (Challenge)
-#   - type_id 49 (Ball recovery)
-#
-# Foul outcome convention in the WhoScored-derived JSON used here is the
-# OPPOSITE of the official Opta F24 spec (Appendix 8). Verified empirically
-# against the next-FK-taker and post-foul card team:
-#     outcome == 0  -> player who COMMITTED the foul
-#     outcome == 1  -> player who WAS fouled
-# Only outcome == 0 fouls (defensive fouls) feed the height calculation —
-# fouls received describe the team's attacking positions and would bias the
-# defensive line upward.
-#
-# Smother (type 54) is intentionally excluded: it always happens near the
-# defender's own goal and would skew height downward.
+# Same definition and values as performance #4 (D5, B10).
 
-PITCH_LENGTH_M = 105.0  # UEFA standard pitch length
-
-defensive_mask = (
-    ((progcarry_df["type_id"] == 4) & (progcarry_df["outcome"] == 0))
-    | progcarry_df["type_id"].isin([7, 8, 12, 44, 45, 49])
-)
-
-variable_ps1 = (
-    progcarry_df[defensive_mask]
-    .groupby(["game_id", "team_id"], as_index=False)["start_x"]
-    .mean()
-    .rename(columns={"start_x": "defensive_height"})
-)
-
-# Convert the 0-100 pitch percentage to meters on a UEFA-standard pitch.
-variable_ps1["defensive_height"] = (
-    variable_ps1["defensive_height"] * PITCH_LENGTH_M / 100.0
-)
+variable_ps1 = variable_df4[["game_id", "team_id", "defensive_height"]].copy()
 
 variable_ps1.head(100).to_csv("variable_ps1.csv", index=True)
 
@@ -5557,37 +2856,13 @@ silently dropped chains of fewer than 2 events -- exactly the fast
 press-recover-press cycles this metric should reward.
 """
 
-FINAL_THIRD = 200.0 / 3.0
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | (_type_id == 8)
-    | ((_type_id == 44) & _outcome)
-)
-
-_recoveries = progcarry_df.loc[_recovery_mask, ["game_id", "team_id", "start_x"]].copy()
-_recoveries["high"] = (_recoveries["start_x"] >= FINAL_THIRD).astype(int)
-
+# Share of regains (D4) made in the final third (x >= 66.67; the reference uses x >= 50 — kept at the final third to
+# match the label, docs/variable_consistency_decisions.md D4).
+_reg = progcarry_df[REGAIN_ROWS]
 variable_ps2 = (
-    _recoveries.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        total_recoveries=("start_x", "size"),
-        high_recoveries=("high", "sum"),
-    )
+    _reg.assign(high=tc.in_final_third(_reg["start_x"]))
+    .groupby(["game_id", "team_id"])["high"].mean().mul(100.0).rename("high_recoveries_%").reset_index()
 )
-variable_ps2["high_recoveries_%"] = np.where(
-    variable_ps2["total_recoveries"] > 0,
-    variable_ps2["high_recoveries"] / variable_ps2["total_recoveries"] * 100.0,
-    np.nan,
-)
-
-variable_ps2 = variable_ps2[
-    ["game_id", "team_id", "total_recoveries", "high_recoveries", "high_recoveries_%"]
-]
 
 variable_ps = variable_ps.merge(
     variable_ps2[["game_id", "team_id", "high_recoveries_%"]],
@@ -5629,124 +2904,8 @@ pressing intensity"""
 # Only outcome == 0 fouls (defensive fouls by the pressing team) feed PPDA.
 
 # Build team <-> opponent mapping per game
-games_teams = progcarry_df[["game_id", "team_id"]].drop_duplicates()
-game_teams_grouped = games_teams.groupby("game_id")["team_id"].apply(list).reset_index()
-
-def get_opponent(game_id, team_id, game_teams_df):
-    teams = game_teams_df.loc[game_teams_df["game_id"] == game_id, "team_id"].iloc[0]
-    if len(teams) != 2:
-        return None
-    return teams[0] if teams[1] == team_id else teams[1]
-
-team_opponent_mapping = []
-for _, row in games_teams.iterrows():
-    opponent = get_opponent(row["game_id"], row["team_id"], game_teams_grouped)
-    if opponent is not None:
-        team_opponent_mapping.append({
-            "game_id": row["game_id"],
-            "team_id": row["team_id"],
-            "opponent_team_id": opponent,
-        })
-team_opponent_df = pd.DataFrame(team_opponent_mapping)
-
-df_with_opponents = progcarry_df.merge(
-    team_opponent_df,
-    on=["game_id", "team_id"],
-    how="left",
-)
-
-# Passes leg: opponent's open-play passes in opponent's own defensive 60%.
-# The passing team's frame has its own goal at x=0, so its defensive 60% is
-# start_x <= 60. Set pieces (FK 5, corner 6, throw-in 107, goal kick 124) are
-# excluded — only open-play passes count toward PPDA.
-SET_PIECE_QUALIFIERS = (5, 6, 107, 124)
-
-_is_set_piece_pass = df_with_opponents["qualifiers"].apply(
-    lambda q: any(has_qualifier(q, qid) for qid in SET_PIECE_QUALIFIERS)
-)
-
-passes = (
-    df_with_opponents[
-        (df_with_opponents["type_id"] == 1)
-        & (df_with_opponents["start_x"] <= 60)
-        & (~_is_set_piece_pass)
-    ]
-    .groupby(["game_id", "team_id"])
-    .size()
-    .reset_index(name="passes_in_def_60")
-)
-
-# Defensive-actions leg: pressing team's tackles/interceptions/fouls in the
-# same physical zone. From the pressing team's frame, that zone is the
-# attacking 60% (start_x >= 40).
-df_press_zone = df_with_opponents[df_with_opponents["start_x"] >= 40]
-
-tackles = (
-    df_press_zone[df_press_zone["type_id"] == 7]
-    .groupby(["game_id", "team_id"])
-    .size()
-    .reset_index(name="tackles")
-)
-
-interceptions = (
-    df_press_zone[df_press_zone["type_id"] == 8]
-    .groupby(["game_id", "team_id"])
-    .size()
-    .reset_index(name="interceptions")
-)
-
-fouls = (
-    df_press_zone[(df_press_zone["type_id"] == 4) & (df_press_zone["outcome"] == 0)]
-    .groupby(["game_id", "team_id"])
-    .size()
-    .reset_index(name="fouls")
-)
-
-defensive_actions = (
-    tackles
-    .merge(interceptions, on=["game_id", "team_id"], how="outer")
-    .merge(fouls, on=["game_id", "team_id"], how="outer")
-    .fillna(0)
-)
-
-defensive_actions["total_def_actions"] = (
-    defensive_actions["tackles"]
-    + defensive_actions["interceptions"]
-    + defensive_actions["fouls"]
-)
-
-ppda_base = defensive_actions.merge(
-    team_opponent_df,
-    on=["game_id", "team_id"],
-    how="left",
-)
-
-# Attribute opponent passes to the pressing team via the opponent mapping.
-ppda_df = ppda_base.merge(
-    passes,
-    left_on=["game_id", "opponent_team_id"],
-    right_on=["game_id", "team_id"],
-    how="left",
-    suffixes=("", "_opponent"),
-)
-
-ppda_df = ppda_df.rename(columns={"passes_in_def_60": "opponent_passes_in_def_60"})
-
-ppda_df["PPDA"] = (
-    ppda_df["opponent_passes_in_def_60"] / ppda_df["total_def_actions"]
-)
-ppda_df["PPDA"] = ppda_df["PPDA"].replace([np.inf, -np.inf], np.nan)
-
-variable_ps3 = ppda_df[[
-    "game_id",
-    "team_id",
-    "tackles",
-    "interceptions",
-    "fouls",
-    "total_def_actions",
-    "opponent_passes_in_def_60",
-    "PPDA",
-]].copy()
+# Same definition and values as performance #1 (D5, B10).
+variable_ps3 = variable_df1[["game_id", "team_id", "PPDA"]].copy()
 
 variable_ps3.head(100).to_csv("variable_ps3.csv", index=True)
 
@@ -5777,7 +2936,7 @@ The inversion is empirically verified on 1955764.json two independent ways
 The canonical "team committed a foul" mask is therefore
   (type_id == 4) & (outcome == 0)
 with team_id taken directly from the row. Matches variable_df4 in
-MatchAnalysis_PlayStyle_2026.py.
+MatchAnalysis_PlayStyle_2025.py.
 
 No possession-chain / defensive-transition gate: a foul by definition is
 committed on an opponent, so the committing team is not in possession;
@@ -5821,88 +2980,17 @@ variable_ps = variable_ps.merge(
 # 5
 # Defensive intensity
 """Defensive intensity is defined as the number of defensive duels, loose ball duels, interceptions,
-tackles, and fouls when out of possession, adjusted by the opponent's possession. It measures how
-actively a player or team engages in defensive actions relative to the amount of time the opponent
-has the ball."""
+tackles, ball recoveries and fouls committed when out of possession, per game (not adjusted for possession: the
+count barely moves with the opponent's possession). It measures how actively a team engages in defensive actions."""
 
-# Defensive Intensity (unadjusted)
-#
-# Per the definition: number of defensive duels, loose ball duels,
-# interceptions, tackles, and fouls committed while out of possession.
-# The possession adjustment (dividing by opponent possession) is applied
-# downstream in the master pipeline, so this module only produces the raw
-# counts per (game_id, team_id).
-#
-# Opta F24 mapping (from reference/Opta-f24_appendices.md):
-#   tackles          -> type_id 7   (all outcomes)
-#   interceptions    -> type_id 8
-#   defensive duels  -> type_id 45  (Challenge: defender fails to win ball)
-#   loose ball duels -> type_id 44  (Aerial 50/50)
-#   fouls committed  -> type_id 4 AND outcome = 0  (outcome 1 = fouled)
-#
-# Foul outcome convention in the WhoScored-derived JSON used here is the
-# OPPOSITE of the official Opta F24 spec (Appendix 8). Verified empirically
-# against the next-FK-taker and post-foul card team:
-#     outcome == 0  -> player who COMMITTED the foul
-#     outcome == 1  -> player who WAS fouled
+# Defensive Intensity — the performance frame's value (D5 set: 7, 8, 44, 45, 49 and committed fouls), a raw count
+# per game (no possession adjustment, see variable_df_new) (B6, B10).
 
-DEFENSIVE_TYPE_IDS = {
-    "tackles": 7,
-    "interceptions": 8,
-    "defensive_duels": 45,
-    "loose_ball_duels": 44,
-}
+variable_ps5 = variable_df_new[["game_id", "team_id", "defensive_intensity"]].copy()
 
-def calculate_defensive_intensity(progcarry_df):
-    """
-    Calculate raw defensive action counts per (game_id, team_id).
-
-    Returns a DataFrame with one row per team per game containing each
-    individual action count and their sum as `defensive_intensity`.
-    The possession adjustment is applied later in the master pipeline.
-    """
-    df = progcarry_df[["game_id", "team_id", "type_id", "outcome"]]
-
-    # Count non-foul defensive action types via a single vectorized groupby.
-    non_foul_mask = df["type_id"].isin(DEFENSIVE_TYPE_IDS.values())
-    counts = (
-        df[non_foul_mask]
-        .groupby(["game_id", "team_id", "type_id"])
-        .size()
-        .unstack(fill_value=0)
-    )
-
-    # Ensure every expected column is present even if a type never occurred.
-    for name, type_id in DEFENSIVE_TYPE_IDS.items():
-        if type_id not in counts.columns:
-            counts[type_id] = 0
-    counts = counts.rename(columns={v: k for k, v in DEFENSIVE_TYPE_IDS.items()})
-    counts = counts[list(DEFENSIVE_TYPE_IDS.keys())]
-
-    # Fouls committed: type 4 with outcome == 0 in this dataset
-    # (WhoScored convention is inverted from the F24 spec — see header).
-    fouls = (
-        df[(df["type_id"] == 4) & (df["outcome"] == 0)]
-        .groupby(["game_id", "team_id"])
-        .size()
-        .rename("fouls_committed")
-    )
-
-    defensive_df = counts.join(fouls, how="outer").fillna(0).astype(int).reset_index()
-
-    action_cols = list(DEFENSIVE_TYPE_IDS.keys()) + ["fouls_committed"]
-    defensive_df["defensive_intensity"] = defensive_df[action_cols].sum(axis=1)
-
-    return defensive_df[
-        ["game_id", "team_id"] + action_cols + ["defensive_intensity"]
-    ]
-
-
-variable_ps5 = calculate_defensive_intensity(progcarry_df)
 variable_ps5.head(100).to_csv("variable_ps5.csv", index=True)
 
-# Merge raw defensive_intensity into variable_ps. Possession adjustment is
-# handled downstream in the master pipeline.
+# Merge defensive_intensity into variable_ps (no possession adjustment).
 variable_ps = variable_ps.merge(
     variable_ps5[["game_id", "team_id", "defensive_intensity"]],
     on=["game_id", "team_id"],
@@ -5923,7 +3011,7 @@ variable_ps["defensive_intensity"] = variable_ps["defensive_intensity"].fillna(0
 between a team losing the ball and that same team making any defensive
 action, successful or not. This is a press-intensity / reactivity signal
 and is deliberately distinct from "Time to Recovery" (variable_df13 in
-MatchAnalysis_PlayStyle_2026.py, which uses only successful ball-regaining
+MatchAnalysis_PlayStyle_2025.py, which uses only successful ball-regaining
 events). A team that slide-tackles at t=2s but misses scores low on this
 metric even though the ball is not yet regained -- that is the intended
 meaning.
@@ -5967,55 +3055,8 @@ skips it). Teams with zero usable pairs keep NaN after the left merge --
 "no data" stays distinct from "responded instantly".
 """
 
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_loss_mask = (
-    ((_type_id == 1) & ~_outcome)
-    | ((_type_id == 3) & ~_outcome)
-    | (_type_id == 50)
-    | (_type_id == 51)
-    | (_type_id == 61)
-)
-
-_defensive_action_mask = (
-    _type_id.isin([49, 8, 7, 44, 12, 45])
-    | ((_type_id == 4) & ~_outcome)
-    | ((_type_id == 11) & _outcome)
-)
-
-_losses = (
-    progcarry_df.loc[_loss_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "loss_time"})
-    .sort_values("loss_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_actions = (
-    progcarry_df.loc[_defensive_action_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "action_time"})
-    .sort_values("action_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_paired = pd.merge_asof(
-    _losses,
-    _actions,
-    left_on="loss_time",
-    right_on="action_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=False,
-)
-
-_paired = _paired.loc[_paired["action_time"].notna()].copy()
-_paired["time_to_defensive_action"] = _paired["action_time"] - _paired["loss_time"]
-
-variable_ps6 = (
-    _paired.groupby(["game_id", "team_id"], as_index=False)["time_to_defensive_action"]
-    .mean()
-    .rename(columns={"time_to_defensive_action": "avg_time_to_defensive_action"})
-)
+# Same definition and values as performance #12 (D3 losses, D5 intensity set).
+variable_ps6 = variable_df12[["game_id", "team_id", "avg_time_to_defensive_action"]].copy()
 
 variable_ps = variable_ps.merge(
     variable_ps6[["game_id", "team_id", "avg_time_to_defensive_action"]],
@@ -6033,7 +3074,7 @@ variable_ps = variable_ps.merge(
 """Counter-Press Success Rate % is the share of a team's open-play
 outfield ball recoveries that occur within 5 seconds of losing the ball
 -- i.e. the success rate of immediate counter-pressing. Adapted from
-MatchAnalysis_PlayStyle_2026.py variable_df11 (Recoveries within 5s %),
+MatchAnalysis_PlayStyle_2025.py variable_df11 (Recoveries within 5s %),
 with the recovery mask narrowed to outfield events for pressing
 semantics (see "Open-play scope" below).
 
@@ -6073,7 +3114,7 @@ The prior implementation had three independent bugs corrected here:
      default) is the project rule for within-window metrics so a
      same-second recovery still pairs with its loss.
   3. No period_id guard: a loss in H1 could pair to a recovery in H2
-     because `time` is per-period seconds. by=[..., period_id] fixes it.
+     (time = minute*60+second with WhoScored's expanded minute (cumulative across periods); pairings group by period).
 
 Pairing: for each recovery, find the most recent same-team loss in the
 same period; the recovery is "within 5s" if recovery_time - loss_time
@@ -6081,70 +3122,8 @@ same period; the recovery is "within 5s" if recovery_time - loss_time
 inside the window) -- matches variable_df11's denominator scoping.
 """
 
-WINDOW_SECONDS = 5.0
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_loss_mask = (
-    ((_type_id == 1) & ~_outcome)
-    | ((_type_id == 3) & ~_outcome)
-    | (_type_id == 50)
-    | (_type_id == 51)
-    | (_type_id == 61)
-)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | (_type_id == 8)
-    | ((_type_id == 44) & _outcome)
-)
-
-_losses = (
-    progcarry_df.loc[_loss_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "loss_time"})
-    .sort_values("loss_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_recoveries = (
-    progcarry_df.loc[_recovery_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_paired = pd.merge_asof(
-    _recoveries,
-    _losses,
-    left_on="recovery_time",
-    right_on="loss_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="backward",
-)
-
-_paired["within_window"] = (
-    _paired["loss_time"].notna()
-    & ((_paired["recovery_time"] - _paired["loss_time"]) <= WINDOW_SECONDS)
-)
-
-variable_ps7 = (
-    _paired.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        total_recoveries=("recovery_time", "size"),
-        recoveries_within_5s=("within_window", "sum"),
-    )
-)
-variable_ps7["counter_press_Success_Rate_%"] = np.where(
-    variable_ps7["total_recoveries"] > 0,
-    variable_ps7["recoveries_within_5s"] / variable_ps7["total_recoveries"] * 100.0,
-    np.nan,
-)
-
-variable_ps7 = variable_ps7[
-    ["game_id", "team_id", "total_recoveries", "recoveries_within_5s", "counter_press_Success_Rate_%"]
-]
+# Same definition and values as performance #11 (D6).
+variable_ps7 = variable_df11.rename(columns={"recoveries_within_5s_%": "counter_press_Success_Rate_%"})
 
 variable_ps = variable_ps.merge(
     variable_ps7[["game_id", "team_id", "counter_press_Success_Rate_%"]],
@@ -6158,47 +3137,17 @@ variable_ps = variable_ps.merge(
 # Variáveis
 # 8
 # Transition Vulnerability Index
-"""Transition Vulnerability Index is the share of the opposition's
-completed open-play passes in the 10 seconds after a team loses the
-ball that are progressive. A high value means the team's losses are
-consistently punished by the opponent advancing the ball into danger --
-i.e. the team is vulnerable in defensive transition.
+"""Transition Vulnerability Index is the share of the opposition's completed open-play passes, in the 10 seconds
+after the team loses the ball, that are progressive. A high value means the team's losses are punished by the
+opponent moving the ball forward quickly.
 
-Loss events (canonical mask, shared with variable_df11 / variable_df13):
-  type_id 1   Pass,      outcome=False  (failed pass)
-  type_id 3   Take On,   outcome=False  (failed dribble)
-  type_id 50  Dispossessed              (Opta outcome always 1)
-  type_id 51  Error                     (Opta outcome always 1)
-  type_id 61  Ball touch
-
-Opposition pass events (transition threat, open play only):
-  (type_id == 1) & (outcome == 1)
-  AND NOT qualifier 5   (Free kick taken)
-  AND NOT qualifier 6   (Corner taken)
-  AND NOT qualifier 107 (Throw-in)
-Set-piece restarts are excluded: they are not transitions, they are
-resets, and including them inflates the denominator with passes that
-don't reflect how well the team defended the loss.
-
-Pairing: pd.merge_asof(direction="backward", allow_exact_matches=False)
-  For each completed opposition pass, find the most recent same-game
-  loss by the OTHER team in the same period. A pass enters the numerator
-  sample if pass_time - loss_time <= 10. Each pass is counted at most
-  once -- fixes the old code's double-counting when rapid consecutive
-  losses had overlapping 8s windows.
-
-Team-flip: the canonical loss row is keyed by the vulnerable team; the
-pass row is keyed by the opposition. merge_asof requires `by` keys to
-match, so we add `opp_team_id` to losses (lookup from a precomputed
-game->opposite-team map) and join on [game_id, opp_team_id, period_id]
-against the pass's team_id. The output is regrouped by the vulnerable
-team for the final per-team-per-game metric.
-
-Window: 10 seconds. The old code hard-coded 8s but the docstring said
-10s; 10s aligns with the docstring's intent, matches tactical literature
-on opposition transition windows, and parallels MatchAnalysis
-variable_df14 which uses the same 10s horizon for its counterpart
-metric ("opp. final-third entries within 10s after recovery").
+Losses: reference losses (D3, LOSS_ROWS) -- (1,0) (3,0) (50,1) (51,1) (61,0), the last own event of the chain, with
+the next event by the opponent.
+Opposition passes: completed passes without free kicks (q5), corners (q6), throw-ins (q107) or goal kicks (q124);
+"progressive" is the reference progressive() rule (D1: length >= 10 Opta units, x gain >= 25% of the distance left).
+Pairing: each opposition pass is matched to the latest loss of the other team in the same game and period
+(merge_asof, backward, strict) and counts when it comes within 10 s; each pass counts once. The window is time-based,
+not bounded to the opponent's chain. Not used in any play-style composite (D13).
 """
 
 WINDOW_SECONDS = 10.0
@@ -6206,16 +3155,10 @@ WINDOW_SECONDS = 10.0
 _type_id = progcarry_df["type_id"]
 _outcome = progcarry_df["outcome"].astype(bool)
 
-_loss_mask = (
-    ((_type_id == 1) & ~_outcome)
-    | ((_type_id == 3) & ~_outcome)
-    | (_type_id == 50)
-    | (_type_id == 51)
-    | (_type_id == 61)
-)
+_loss_mask = LOSS_ROWS  # D3 reference losses
 
 _is_set_piece = progcarry_df["qualifiers"].apply(
-    lambda q: has_qualifier(q, 5) or has_qualifier(q, 6) or has_qualifier(q, 107)
+    lambda q: has_qualifier(q, 5) or has_qualifier(q, 6) or has_qualifier(q, 107) or has_qualifier(q, 124)
 )
 _pass_mask = (_type_id == 1) & _outcome & ~_is_set_piece
 
@@ -6306,147 +3249,8 @@ successfully enters the final third of the pitch within 10 seconds after recover
 metric helps in understanding how quickly and effectively the opposition can transition from defense 
 to attack and create potential scoring opportunities."""
 
-# Opp. Final Third Entries Within 10s After Recovery
-#
-# For each team T, the number of the OPPONENT's recoveries that are
-# followed by a final-third event within 10 seconds. Captures how often
-# the opposition converts a regained ball into a fast transition.
-#
-# Recovery events (same set as variable_ps11_code.py):
-#   type_id 49  Ball recovery            (Opta outcome always 1, ref line 818)
-#   type_id 8   Interception             (Opta outcome always 1, ref line 772
-#                                         of Opta-f24_appendices.md; verified
-#                                         empirically on 1955764.json: 21/21
-#                                         type-8 events with outcome=1)
-#   type_id 7   Tackle,     outcome=True
-#   type_id 44  Aerial,     outcome=True
-#   type_id 11  Claim,      outcome=True
-#
-#
-# Final-third entry event: any event with end_x >= 200/3 (~66.67). Opta
-# F24 Appendix 11 (reference/Opta-f24_appendices.md line 950) normalizes
-# every event L->R in the event team's attacking direction, so end_x >=
-# 2/3 is always the event team's attacking third. The original code's
-# two disjunctions ("crossed into" | "already in") simplify to the single
-# `end_x >= 66.67` condition.
-#
-# Recovery inside the final third: if the recovery event itself ends in
-# the final third (a high press won deep), it self-pairs at delta=0 and
-# counts as a successful fast transition. merge_asof with direction=
-# "forward" and allow_exact_matches=True gives that behavior for free.
-#
-# Pairing: pd.merge_asof(recoveries, entry_events, direction="forward",
-# by=[game_id, team_id, period_id]) finds, for each recovery, the
-# earliest same-team event at or after recovery_time whose end_x lands
-# in the final third. If the gap is <= 10s the recovery is counted.
-# Replaces the original O(recoveries * frame_size) nested iterrows loop
-# with an O(n log n) vectorized pairing. Grouping by period_id prevents
-# a recovery at the end of H1 from being paired with an event at the
-# start of H2 (time is per-period seconds in progcarry_df).
-#
-# Short-chain bias: the original gated recoveries on `first_chain == 1`,
-# which possession_chain_code.py only sets on chains of >= 2 events, so
-# single-event possessions were silently dropped. The event-type mask
-# alone carries the "team won the ball" semantics and does not need the
-# chain guard.
-#
-# Opposition swap: for team T in game G, variable_ps9 carries the
-# other team's count in `opposition_final_third_entries_10s`. Same
-# self-merge pattern as variable_ps6_code.py.
-#
-# NaN preservation: the post-merge `fillna(0)` is intentionally NOT
-# applied. The Z-score pipeline can't distinguish "opponent had 0 fast
-# transitions" (a legitimate league extreme) from "team was missing
-# entirely from progcarry_df" — a 0 in the second case sits at the
-# league mean and biases the Z. Same reasoning as the rest of the
-# defensive-metric suite (e.g. perdas_posse_linha_baixa.py).
-
-FINAL_THIRD = 200.0 / 3.0
-WINDOW_SECONDS = 10.0
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | ((_type_id == 8))
-    | ((_type_id == 44) & _outcome)
-    | ((_type_id == 11) & _outcome)
-)
-
-_recoveries = (
-    progcarry_df.loc[_recovery_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_entry_events = (
-    progcarry_df.loc[
-        progcarry_df["end_x"] >= FINAL_THIRD,
-        ["game_id", "team_id", "period_id", "time"],
-    ]
-    .rename(columns={"time": "entry_time"})
-    .sort_values("entry_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# For each recovery, find the earliest same-team final-third event at or
-# after the recovery. allow_exact_matches=True lets a recovery whose own
-# event is in the final third self-pair at delta=0.
-_paired = pd.merge_asof(
-    _recoveries,
-    _entry_events,
-    left_on="recovery_time",
-    right_on="entry_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=True,
-)
-
-_paired["within_window"] = (
-    _paired["entry_time"].notna()
-    & ((_paired["entry_time"] - _paired["recovery_time"]) <= WINDOW_SECONDS)
-)
-
-_team_stats = (
-    _paired.groupby(["game_id", "team_id"], as_index=False)["within_window"]
-    .sum()
-    .rename(columns={"within_window": "final_third_entries_10s"})
-)
-_team_stats["final_third_entries_10s"] = (
-    _team_stats["final_third_entries_10s"].astype(int)
-)
-
-# Opposition swap: attach each team's count to the OTHER team's row.
-_opposition = (
-    _team_stats.merge(
-        _team_stats.rename(
-            columns={
-                "team_id": "opponent_team_id",
-                "final_third_entries_10s": "opposition_final_third_entries_10s",
-            }
-        ),
-        on="game_id",
-    )
-    .query("team_id != opponent_team_id")
-    [["game_id", "team_id", "opposition_final_third_entries_10s"]]
-)
-
-variable_ps9 = _team_stats.merge(
-    _opposition,
-    on=["game_id", "team_id"],
-    how="left",
-)[
-    [
-        "game_id",
-        "team_id",
-        "final_third_entries_10s",
-        "opposition_final_third_entries_10s",
-    ]
-]
-
+# Same values as performance #14 (D2, B10).
+variable_ps9 = variable_df14.copy()
 variable_ps9.head(100).to_csv("variable_ps9.csv", index=True)
 
 variable_ps = variable_ps.merge(
@@ -6465,152 +3269,8 @@ successfully enters the penalty box within 10 seconds after recovering possessio
 helps in understanding how quickly and effectively the opposition can transition from defense 
 to attack and create potential scoring opportunities in the penalty area."""
 
-# Opp. Box Entries Within 10s After Recovery
-#
-# For each team T, the number of the OPPONENT's recoveries that are
-# followed by a penalty-box entry within 10 seconds. Captures how often
-# the opposition converts a regained ball into a fast attack reaching
-# the box. Direct analog of variable_ps14_code.py with the final-third
-# zone replaced by the penalty box.
-#
-# Recovery events (same set as variable_ps11_code.py / variable_ps14_code.py):
-#   type_id 49  Ball recovery            (Opta outcome always 1, ref line 818)
-#   type_id 8   Interception             (Opta outcome always 1, ref line 772
-#                                         of Opta-f24_appendices.md; verified
-#                                         empirically on 1955764.json: 21/21
-#                                         type-8 events with outcome=1)
-#   type_id 7   Tackle,     outcome=True
-#   type_id 44  Aerial,     outcome=True
-#   type_id 11  Claim,      outcome=True
-#
-# Penalty box: Opta F24 Appendix 11 (reference/Opta-f24_appendices.md
-# line 957) places the 18-yard box at x >= 83 and 21.1 <= y <= 78.9.
-# A box-entry event is any event whose END coordinates land in the box,
-# which is exactly the union of "crossed in" and "already in, stayed in"
-# (the two disjuncts in the original code).
-#
-# Recovery inside the box: if the recovery event itself ends in the box
-# (a high press won deep), it self-pairs at delta=0 and counts as a
-# successful fast box entry. merge_asof with allow_exact_matches=True
-# and direction="forward" gives that behavior for free.
-#
-# Pairing: pd.merge_asof(recoveries, box_entries, direction="forward",
-# by=[game_id, team_id, period_id]) finds, for each recovery, the
-# earliest same-team event at or after recovery_time whose end
-# coordinates land in the box. If the gap is <= 10s the recovery is
-# counted. O(n log n) and exact, versus the original nested iterrows
-# + per-event apply. Grouping by period_id prevents a recovery at the
-# end of H1 from being paired with an event at the start of H2
-# (progcarry_df `time` is per-period seconds).
-#
-# Short-chain bias: the original gated recoveries on `first_chain == 1`,
-# which possession_chain_code.py only sets on chains of >= 2 events, so
-# single-event possessions were silently dropped. The event-type mask
-# alone carries the "team won the ball" semantics.
-#
-# Semantic fix: the original iterated (game_id, team_id) groups and
-# paired THIS team's recoveries with the OPPOSITION's next 10s of
-# events, then never applied an opposition swap at the end. That stored
-# the wrong value against each team. This rewrite mirrors
-# variable_ps14_code.py: count fast-transition recoveries per team,
-# then swap so team T's row carries the OPPONENT's count.
-#
-# NaN preservation: the post-merge `fillna(0)` is intentionally NOT
-# applied. The Z-score pipeline can't distinguish "opponent had 0 fast
-# box entries" (a legitimate league extreme) from "team was missing
-# entirely from progcarry_df" — a 0 in the second case sits at the
-# league mean and biases the Z. Same reasoning as the rest of the
-# defensive-metric suite (e.g. variable_ps14_code.py).
-
-BOX_X = 83.0
-BOX_Y_MIN = 21.1
-BOX_Y_MAX = 78.9
-WINDOW_SECONDS = 10.0
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | ((_type_id == 8))
-    | ((_type_id == 44) & _outcome)
-    | ((_type_id == 11) & _outcome)
-)
-
-_box_entry_mask = (
-    (progcarry_df["end_x"] >= BOX_X)
-    & (progcarry_df["end_y"] >= BOX_Y_MIN)
-    & (progcarry_df["end_y"] <= BOX_Y_MAX)
-)
-
-_recoveries = (
-    progcarry_df.loc[_recovery_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_box_entries = (
-    progcarry_df.loc[_box_entry_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "entry_time"})
-    .sort_values("entry_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# For each recovery, find the earliest same-team box-entry event at or
-# after the recovery. allow_exact_matches=True lets a recovery whose own
-# event already lands in the box self-pair at delta=0.
-_paired = pd.merge_asof(
-    _recoveries,
-    _box_entries,
-    left_on="recovery_time",
-    right_on="entry_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=True,
-)
-
-_paired["within_window"] = (
-    _paired["entry_time"].notna()
-    & ((_paired["entry_time"] - _paired["recovery_time"]) <= WINDOW_SECONDS)
-)
-
-_team_stats = (
-    _paired.groupby(["game_id", "team_id"], as_index=False)["within_window"]
-    .sum()
-    .rename(columns={"within_window": "box_entries_10s"})
-)
-_team_stats["box_entries_10s"] = _team_stats["box_entries_10s"].astype(int)
-
-# Opposition swap: attach each team's count to the OTHER team's row.
-_opposition = (
-    _team_stats.merge(
-        _team_stats.rename(
-            columns={
-                "team_id": "opponent_team_id",
-                "box_entries_10s": "opposition_box_entries_10s",
-            }
-        ),
-        on="game_id",
-    )
-    .query("team_id != opponent_team_id")
-    [["game_id", "team_id", "opposition_box_entries_10s"]]
-)
-
-variable_ps10 = _team_stats.merge(
-    _opposition,
-    on=["game_id", "team_id"],
-    how="left",
-)[
-    [
-        "game_id",
-        "team_id",
-        "box_entries_10s",
-        "opposition_box_entries_10s",
-    ]
-]
-
+# Same values as performance #15 (D2, B10).
+variable_ps10 = variable_df15.copy()
 variable_ps10.head(100).to_csv("variable_ps10.csv", index=True)
 
 variable_ps = variable_ps.merge(
@@ -6672,105 +3332,18 @@ NaN: recoveries with no valid pair are excluded from the per-game mean
 the left merge -- "no data" stays distinct from "progressed instantly".
 """
 
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | (_type_id == 8)
-    | ((_type_id == 44) & _outcome)
+# Own-half regain (D4, start_x < 50) -> first completed pass or carry of the team ending in the opponent half,
+# before the team's next loss (D3). Carries are types 1000 and 2000 (B7).
+_ev = progcarry_df
+_from = REGAIN_ROWS & (_ev["start_x"] < tc.HALF_X)
+_prog = ((tc.completed_pass(_ev) | _ev["type_id"].isin(tc.CARRY_TYPES)) & (_ev["end_x"] >= tc.HALF_X))
+_to_prog = tc.next_event(_ev, _from, _prog)
+_to_loss = tc.next_event(_ev, _from, LOSS_ROWS)
+_to_prog["seconds"] = _to_prog["seconds"].where(~(_to_loss["to_pos"] < _to_prog["to_pos"]))
+variable_ps11 = (
+    _to_prog.groupby(["game_id", "team_id"])["seconds"].mean()
+    .rename("time_to_progression_seconds").reset_index()
 )
-
-_loss_mask = (
-    ((_type_id == 1) & ~_outcome)
-    | ((_type_id == 3) & ~_outcome)
-    | (_type_id == 50)
-    | (_type_id == 51)
-    | (_type_id == 61)
-)
-
-_progression_mask = (
-    _type_id.isin([1, 2000])
-    & _outcome
-    & (progcarry_df["end_x"] >= 50)
-)
-
-_own_half_recoveries = (
-    progcarry_df.loc[_recovery_mask & (progcarry_df["start_x"] < 50), ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_progressions = (
-    progcarry_df.loc[_progression_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "prog_time"})
-    .sort_values("prog_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_losses_v11 = (
-    progcarry_df.loc[_loss_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "loss_time"})
-    .sort_values("loss_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# For each own-half recovery, next same-team progression in the same period.
-_rec_prog = pd.merge_asof(
-    _own_half_recoveries,
-    _progressions,
-    left_on="recovery_time",
-    right_on="prog_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=False,
-)
-
-# For each own-half recovery, next same-team loss in the same period.
-_rec_loss = pd.merge_asof(
-    _own_half_recoveries,
-    _losses_v11,
-    left_on="recovery_time",
-    right_on="loss_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=False,
-)
-
-_paired = _rec_prog.copy()
-_paired["loss_time"] = _rec_loss["loss_time"].to_numpy()
-_paired["valid"] = (
-    _paired["prog_time"].notna()
-    & (_paired["loss_time"].isna() | (_paired["prog_time"] < _paired["loss_time"]))
-)
-_paired["time_to_progression"] = _paired["prog_time"] - _paired["recovery_time"]
-
-_valid = _paired.loc[_paired["valid"]].copy()
-
-_own_half_counts = (
-    _own_half_recoveries.groupby(["game_id", "team_id"], as_index=False)
-    .size()
-    .rename(columns={"size": "own_half_recoveries"})
-)
-
-_progression_stats = (
-    _valid.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        successful_progressions=("time_to_progression", "size"),
-        time_to_progression_seconds=("time_to_progression", "mean"),
-    )
-)
-
-variable_ps11 = _own_half_counts.merge(
-    _progression_stats,
-    on=["game_id", "team_id"],
-    how="left",
-)
-variable_ps11 = variable_ps11[
-    ["game_id", "team_id", "own_half_recoveries", "successful_progressions", "time_to_progression_seconds"]
-]
 
 variable_ps = variable_ps.merge(
     variable_ps11[["game_id", "team_id", "time_to_progression_seconds"]],
@@ -6832,98 +3405,14 @@ Forward definition: end_x > start_x (strict). Standard football-
 analytics definition. end_x == start_x is lateral, not forward.
 """
 
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | (_type_id == 8)
-    | ((_type_id == 44) & _outcome)
-)
-
-_loss_mask = (
-    ((_type_id == 1) & ~_outcome)
-    | ((_type_id == 3) & ~_outcome)
-    | (_type_id == 50)
-    | (_type_id == 51)
-    | (_type_id == 61)
-)
-
-_is_set_piece = progcarry_df["qualifiers"].apply(
-    lambda q: has_qualifier(q, 5) or has_qualifier(q, 6) or has_qualifier(q, 107)
-)
-_pass_mask_v12 = (_type_id == 1) & ~_is_set_piece
-
-_recoveries_v12 = (
-    progcarry_df.loc[_recovery_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_passes_v12 = (
-    progcarry_df.loc[_pass_mask_v12, ["game_id", "team_id", "period_id", "time", "start_x", "end_x"]]
-    .rename(columns={"time": "pass_time"})
-    .sort_values("pass_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-_passes_v12["is_forward"] = (_passes_v12["end_x"] > _passes_v12["start_x"]).astype(int)
-
-_losses_v12 = (
-    progcarry_df.loc[_loss_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "loss_time"})
-    .sort_values("loss_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# Next same-team pass after each recovery, same period.
-_rec_pass = pd.merge_asof(
-    _recoveries_v12,
-    _passes_v12,
-    left_on="recovery_time",
-    right_on="pass_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=False,
-)
-
-# Next same-team loss after each recovery, same period.
-_rec_loss = pd.merge_asof(
-    _recoveries_v12,
-    _losses_v12,
-    left_on="recovery_time",
-    right_on="loss_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=False,
-)
-
-_paired_v12 = _rec_pass.copy()
-_paired_v12["loss_time"] = _rec_loss["loss_time"].to_numpy()
-_paired_v12["valid"] = (
-    _paired_v12["pass_time"].notna()
-    & (_paired_v12["loss_time"].isna() | (_paired_v12["pass_time"] <= _paired_v12["loss_time"]))
-)
-
-_valid_v12 = _paired_v12.loc[_paired_v12["valid"]].copy()
-
+# First open-play pass after each regain (D4) that goes forward (end_x > start_x).
+_open_pass = (progcarry_df["type_id"] == 1) & ~tc.restart_pass(progcarry_df)
+_nx = tc.next_event(progcarry_df, REGAIN_ROWS, _open_pass).dropna(subset=["to_pos"])
+_first = progcarry_df.iloc[_nx["to_pos"].astype(int).to_numpy()]
 variable_ps12 = (
-    _valid_v12.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        recoveries_with_pass=("pass_time", "size"),
-        forward_first_passes=("is_forward", "sum"),
-    )
+    _nx.assign(forward=(_first["end_x"].to_numpy() > _first["start_x"].to_numpy()))
+    .groupby(["game_id", "team_id"])["forward"].mean().mul(100.0).rename("first_pass_forward_pct").reset_index()
 )
-variable_ps12["first_pass_forward_pct"] = np.where(
-    variable_ps12["recoveries_with_pass"] > 0,
-    variable_ps12["forward_first_passes"] / variable_ps12["recoveries_with_pass"] * 100,
-    np.nan,
-)
-
-variable_ps12 = variable_ps12[
-    ["game_id", "team_id", "recoveries_with_pass", "forward_first_passes", "first_pass_forward_pct"]
-]
 
 variable_ps = variable_ps.merge(
     variable_ps12[["game_id", "team_id", "first_pass_forward_pct"]],
@@ -6938,7 +3427,7 @@ variable_ps = variable_ps.merge(
 # Final third entries within 10s after own half recovery %
 """Final-third entries within 10s after own-half recovery % is the share
 of a team's own-half recoveries that lead to a final-third entry within
-10 seconds. Same mechanism as MatchAnalysis_PlayStyle_2026.py
+10 seconds. Same mechanism as MatchAnalysis_PlayStyle_2025.py
 variable_df14 (opposition view) / variable_df21 (own-team view); this
 file is the own-team view restricted to recoveries that started in the
 team's own half (start_x < 50). Drops type 11 (Claim) for play-style
@@ -6981,71 +3470,15 @@ period_id], allow_exact_matches=True) finds, for each own-half
 recovery, the earliest same-team entry event at or after the recovery
 time. If the gap is <= 10s the recovery counts in the numerator. The
 period_id guard prevents a H1-end recovery from pairing with an
-H2-start entry (time is per-period seconds).
+H2-start entry (time = minute*60+second with WhoScored's expanded minute (cumulative across periods); pairings group by period).
 
 Denominator = all own-half recoveries for that team-game. Numerator =
 own-half recoveries with a within-10s final-third entry. Ratio * 100.
 """
 
-FINAL_THIRD = 200.0 / 3.0
-WINDOW_SECONDS = 10.0
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | (_type_id == 8)
-    | ((_type_id == 44) & _outcome)
-)
-
-_own_half_recoveries_v13 = (
-    progcarry_df.loc[_recovery_mask & (progcarry_df["start_x"] < 50), ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_entry_events_v13 = (
-    progcarry_df.loc[progcarry_df["end_x"] >= FINAL_THIRD, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "entry_time"})
-    .sort_values("entry_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_paired_v13 = pd.merge_asof(
-    _own_half_recoveries_v13,
-    _entry_events_v13,
-    left_on="recovery_time",
-    right_on="entry_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=True,
-)
-
-_paired_v13["within_window"] = (
-    _paired_v13["entry_time"].notna()
-    & ((_paired_v13["entry_time"] - _paired_v13["recovery_time"]) <= WINDOW_SECONDS)
-)
-
-variable_ps13 = (
-    _paired_v13.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        own_half_recoveries=("recovery_time", "size"),
-        final_third_entries=("within_window", "sum"),
-    )
-)
-variable_ps13["final_third_entries"] = variable_ps13["final_third_entries"].astype(int)
-variable_ps13["final_third_entries_10s_pct"] = np.where(
-    variable_ps13["own_half_recoveries"] > 0,
-    variable_ps13["final_third_entries"] / variable_ps13["own_half_recoveries"] * 100,
-    np.nan,
-)
-
-variable_ps13 = variable_ps13[
-    ["game_id", "team_id", "own_half_recoveries", "final_third_entries", "final_third_entries_10s_pct"]
-]
+_r13 = REGAINS[(REGAINS["start_x"] < tc.HALF_X) & ~REGAINS["in_third"]]
+variable_ps13 = (_r13.groupby(["game_id", "team_id"])["reaches_third"].mean().mul(100.0)
+                 .rename("final_third_entries_10s_pct").reset_index())
 
 variable_ps = variable_ps.merge(
     variable_ps13[["game_id", "team_id", "final_third_entries_10s_pct"]],
@@ -7061,7 +3494,7 @@ variable_ps = variable_ps.merge(
 """Box entries within 10s after attacking-half recovery % is the share
 of a team's attacking-half recoveries (high-press wins with start_x >=
 50) that lead to a penalty-box entry within 10 seconds. Same mechanism
-as MatchAnalysis_PlayStyle_2026.py variable_df15 (opposition view) /
+as MatchAnalysis_PlayStyle_2025.py variable_df15 (opposition view) /
 variable_df22 (own-team view); this file is the own-team view
 restricted to recoveries that started in the team's attacking half
 (start_x >= 50), and outputs a percentage. Drops type 11 (Claim) for
@@ -7115,73 +3548,9 @@ Numerator = attacking-half recoveries with a within-10s box entry.
 Ratio * 100.
 """
 
-BOX_X = 83.0
-BOX_Y_MIN = 21.1
-BOX_Y_MAX = 78.9
-WINDOW_SECONDS = 10.0
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | (_type_id == 8)
-    | ((_type_id == 44) & _outcome)
-)
-
-_box_entry_mask = (
-    (progcarry_df["end_x"] >= BOX_X)
-    & (progcarry_df["end_y"] >= BOX_Y_MIN)
-    & (progcarry_df["end_y"] <= BOX_Y_MAX)
-)
-
-_att_half_recoveries_v14 = (
-    progcarry_df.loc[_recovery_mask & (progcarry_df["start_x"] >= 50), ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_box_entries_v14 = (
-    progcarry_df.loc[_box_entry_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "entry_time"})
-    .sort_values("entry_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_paired_v14 = pd.merge_asof(
-    _att_half_recoveries_v14,
-    _box_entries_v14,
-    left_on="recovery_time",
-    right_on="entry_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=True,
-)
-
-_paired_v14["within_window"] = (
-    _paired_v14["entry_time"].notna()
-    & ((_paired_v14["entry_time"] - _paired_v14["recovery_time"]) <= WINDOW_SECONDS)
-)
-
-variable_ps14 = (
-    _paired_v14.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        attacking_half_recoveries=("recovery_time", "size"),
-        box_entries=("within_window", "sum"),
-    )
-)
-variable_ps14["box_entries"] = variable_ps14["box_entries"].astype(int)
-variable_ps14["box_entries_10s_pct"] = np.where(
-    variable_ps14["attacking_half_recoveries"] > 0,
-    variable_ps14["box_entries"] / variable_ps14["attacking_half_recoveries"] * 100,
-    np.nan,
-)
-
-variable_ps14 = variable_ps14[
-    ["game_id", "team_id", "attacking_half_recoveries", "box_entries", "box_entries_10s_pct"]
-]
+_r14 = REGAINS[(REGAINS["start_x"] >= tc.HALF_X) & ~REGAINS["in_box"]]
+variable_ps14 = (_r14.groupby(["game_id", "team_id"])["reaches_box"].mean().mul(100.0)
+                 .rename("box_entries_10s_pct").reset_index())
 
 variable_ps = variable_ps.merge(
     variable_ps14[["game_id", "team_id", "box_entries_10s_pct"]],
@@ -7210,46 +3579,10 @@ Chain duration is derived from progcarry_chains_df as max(time) -
 min(time) per chain, same source and arithmetic as the possession
 dataframe earlier in the pipeline.
 
-Note on possession chain coverage: possession_chain.py has no
-MIN_CHAIN_LEN logic -- it does not exclude short chains, so this
-metric counts every chain (including any single-event chains) for
-that team-game. The previous implementation filtered possessionId
-!= 0, which silently dropped only the very first chain of the
-entire parquet (one chain in one game out of ~380); removed for
-cleanliness. A single-event chain contributes 0 duration so it
-trivially fails the 5s threshold and only affects the denominator.
+Chain note: chain ids start at 1 (ref_pipeline.chains_table); the != 0 filter keeps every chain.
 """
 
-RETENTION_THRESHOLD_SECONDS = 5.0
-
-_chain_time_v15 = progcarry_chains_df["minute"] * 60 + progcarry_chains_df["second"]
-_chain_durations_v15 = (
-    progcarry_chains_df.assign(_time=_chain_time_v15)
-    .groupby(["game_id", "team_id", "possessionId"])["_time"]
-    .agg(lambda t: t.max() - t.min())
-    .reset_index(name="chain_duration")
-)
-_chain_durations_v15["retained"] = (
-    _chain_durations_v15["chain_duration"] >= RETENTION_THRESHOLD_SECONDS
-)
-
-variable_ps15 = (
-    _chain_durations_v15.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        total_valid_possessions=("retained", "size"),
-        retained_possessions_5s=("retained", "sum"),
-    )
-)
-variable_ps15["retained_possessions_5s"] = variable_ps15["retained_possessions_5s"].astype(int)
-variable_ps15["retained_possessions_5s_pct"] = np.where(
-    variable_ps15["total_valid_possessions"] > 0,
-    variable_ps15["retained_possessions_5s"] / variable_ps15["total_valid_possessions"] * 100,
-    np.nan,
-)
-
-variable_ps15 = variable_ps15[
-    ["game_id", "team_id", "total_valid_possessions", "retained_possessions_5s", "retained_possessions_5s_pct"]
-]
+variable_ps15 = variable_df20.rename(columns={"retained_possessions_5s_%": "retained_possessions_5s_pct"})
 
 variable_ps = variable_ps.merge(
     variable_ps15[["game_id", "team_id", "retained_possessions_5s_pct"]],
@@ -7274,78 +3607,8 @@ same successful-only choice and same set-piece policy. This file is the
 play-style copy living in the project root.
 """
 
-# Per team per game, the share of the team's SUCCESSFUL OPEN-PLAY
-# passes that are long balls. Opta F24 Appendix defines a long ball
-# as a pass over 35 yards (reference/Opta-f24_appendices.md line 138),
-# flagged by qualifier 1 on a type_id == 1 Pass event. "Longball" is
-# a presence-only qualifier -- no value attached -- so the predicate
-# is "qualifier 1 is present on the pass row", not "qualifier 1
-# equals True".
-#
-# Successful-only choice: the metric definition is ambiguous between
-# "share of all passes" and "share of successful passes". Original
-# code used successful-only and downstream consumers expect that, so
-# the rewrite keeps it. Mirrors variable_df27. (For an all-passes
-# variant, drop the outcome gate from both numerator and denominator.)
-#
-# Set-piece policy (mirrors variable_df27): exclude qualifiers
-#   5   (Free kick taken)
-#   6   (Corner taken)
-#   107 (Throw-in)
-# but KEEP qualifier 124 (Goal kick). Goal kicks ARE the direct-vs-
-# possession signal this metric is designed to capture. Free kicks,
-# corners, and throw-ins are pre-planned restart deliveries by a
-# specialist taker and do not reflect the team's in-play tactical
-# preference. Without this filter, teams that take many long set-piece
-# deliveries get inflated long-ball percentages.
-#
-# Qualifier detection: uses the has_qualifier helper to check for
-# qualifier 1 (long ball) in the qualifiers list-of-dicts format.
-#
-# Replaces the original `qualifiers.apply(lambda x: 1 in x and x[1] == True)`
-# which (a) assumes `qualifiers` is a dict (it's a string in the
-# upstream feed) and (b) checks `== True` on a presence-only qualifier
-# that has no value. The original code silently returns zero long
-# balls for every team.
-#
-# Input source: uses `progcarry_df` (pipeline convention) rather than
-# the original `df` reference -- progcarry_df is the event source of
-# truth across all variable_df* metrics in this pipeline and carries
-# type 1 Pass events.
-#
-# NaN preservation: teams with zero open-play successful passes (a
-# degenerate case) keep NaN through the np.where guard AND the left
-# merge into variable_ps. Filling 0 here would bias the Z-score
-# downward (long ball % natural range is 8-25%, neutral ~15).
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-SET_PIECE_QUALIFIERS = (5, 6, 107)  # FK taken, corner taken, throw-in -- KEEP 124 (goal kicks)
-
-_is_set_piece = progcarry_df["qualifiers"].apply(
-    lambda q: any(has_qualifier(q, qid) for qid in SET_PIECE_QUALIFIERS)
-)
-_pass_mask = (_type_id == 1) & _outcome & ~_is_set_piece
-
-_passes = progcarry_df.loc[_pass_mask, ["game_id", "team_id", "qualifiers"]].copy()
-_passes["is_long"] = _passes["qualifiers"].apply(lambda q: has_qualifier(q, 1)).astype(int)
-_passes = _passes.drop(columns=["qualifiers"])
-
-variable_ps16 = (
-    _passes.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        total_passes=("is_long", "size"),
-        long_balls=("is_long", "sum"),
-    )
-)
-variable_ps16["long_ball_%"] = np.where(
-    variable_ps16["total_passes"] > 0,
-    variable_ps16["long_balls"] / variable_ps16["total_passes"] * 100.0,
-    np.nan,
-)
-
-variable_ps16 = variable_ps16[["game_id", "team_id", "long_ball_%"]]
+# Same definition and values as performance #27 (D8, B10).
+variable_ps16 = variable_df27[["game_id", "team_id", "long_ball_%"]].copy()
 
 variable_ps = variable_ps.merge(
     variable_ps16[["game_id", "team_id", "long_ball_%"]],
@@ -7419,145 +3682,18 @@ Implementation: vectorized via merge_asof.
   - Per team-game: (successful_buildups / total_goal_kicks) * 100.
 """
 
-MIN_PASSES_FOR_BUILDUP = 4
-MIN_SECONDS_FOR_BUILDUP = 8.0
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_goal_kick_mask = (_type_id == 1) & progcarry_df["qualifiers"].apply(
-    lambda q: has_qualifier(q, 124)
-)
-
-_loss_mask = (
-    ((_type_id == 1) & ~_outcome)
-    | ((_type_id == 3) & ~_outcome)
-    | (_type_id == 50)
-    | (_type_id == 51)
-    | (_type_id == 61)
-)
-
-_pass_mask_v17 = (_type_id == 1) & _outcome
-
-_goal_kicks_v17 = (
-    progcarry_df.loc[_goal_kick_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "kick_time"})
-    .sort_values("kick_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-_goal_kicks_v17["kick_id"] = _goal_kicks_v17.index
-
-_losses_v17 = (
-    progcarry_df.loc[_loss_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "loss_time"})
-    .sort_values("loss_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_passes_v17 = (
-    progcarry_df.loc[_pass_mask_v17, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "pass_time"})
-    .sort_values("pass_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# Termination time: next same-team canonical loss in the same period.
-# allow_exact_matches=True so a FAILED goal kick (itself in the loss
-# mask) pairs with itself -> window_end = kick_time -> no subsequent
-# regained-possession passes get attributed to it. A successful kick
-# is NOT in the loss mask, so its self-pair is unaffected.
-_gk_next_loss = pd.merge_asof(
-    _goal_kicks_v17,
-    _losses_v17,
-    left_on="kick_time",
-    right_on="loss_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=True,
-)[["kick_id", "loss_time"]]
-
-# Termination time: next same-team goal kick in the same period.
-_gk_next_kick = pd.merge_asof(
-    _goal_kicks_v17,
-    _goal_kicks_v17[["game_id", "team_id", "period_id", "kick_time"]].rename(
-        columns={"kick_time": "next_kick_time"}
-    ),
-    left_on="kick_time",
-    right_on="next_kick_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="forward",
-    allow_exact_matches=False,
-)[["kick_id", "next_kick_time"]]
-
-_gk_bounded = (
-    _goal_kicks_v17.merge(_gk_next_loss, on="kick_id", how="left")
-    .merge(_gk_next_kick, on="kick_id", how="left")
-)
-# Earliest of next_loss / next_kick; NaN if neither (end-of-period case).
-_gk_bounded["window_end"] = _gk_bounded[["loss_time", "next_kick_time"]].min(
-    axis=1, skipna=True
-)
-
-# Attribute each successful pass to its preceding same-team goal kick.
-_pass_to_kick = pd.merge_asof(
-    _passes_v17,
-    _goal_kicks_v17[["game_id", "team_id", "period_id", "kick_time", "kick_id"]],
-    left_on="pass_time",
-    right_on="kick_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="backward",
-    allow_exact_matches=True,
-)
-# Drop passes that have no preceding goal kick (no buildup context).
-_pass_to_kick = _pass_to_kick.dropna(subset=["kick_id"])
-_pass_to_kick["kick_id"] = _pass_to_kick["kick_id"].astype(int)
-
-# Keep passes that fall at or before their kick's window_end
-# (NaN window_end means the sequence runs unbounded to period end, so keep).
-_pass_to_kick = _pass_to_kick.merge(
-    _gk_bounded[["kick_id", "window_end"]], on="kick_id", how="left"
-)
-_pass_to_kick = _pass_to_kick.loc[
-    _pass_to_kick["window_end"].isna()
-    | (_pass_to_kick["pass_time"] <= _pass_to_kick["window_end"])
-]
-
-# Per goal kick: pass count and span.
-_per_kick = (
-    _pass_to_kick.groupby("kick_id", as_index=False)
-    .agg(
-        pass_count=("pass_time", "size"),
-        first_pass_time=("pass_time", "min"),
-        last_pass_time=("pass_time", "max"),
-    )
-)
-_per_kick = _gk_bounded[["kick_id", "game_id", "team_id", "kick_time"]].merge(
-    _per_kick, on="kick_id", how="left"
-)
-_per_kick["pass_count"] = _per_kick["pass_count"].fillna(0).astype(int)
-_per_kick["duration"] = _per_kick["last_pass_time"] - _per_kick["kick_time"]
-_per_kick["established"] = (
-    (_per_kick["pass_count"] >= MIN_PASSES_FOR_BUILDUP)
-    & (_per_kick["duration"] >= MIN_SECONDS_FOR_BUILDUP)
-)
-
+# Goal-kick chains (first chain-team event is a q124 pass) that become a build-up: >= 4 completed chain-team passes
+# after the kick and >= 8 s of possession. The chain ends at the loss (D3), so no separate loss mask is needed.
+_ct = progcarry_df[progcarry_df["is_chain_team"].fillna(False).astype(bool) & progcarry_df["chain_id"].notna()]
+_ck = [_ct["game_id"], _ct["chain_id"]]
+_head = _ct.groupby(_ck, sort=False).head(1)
+_gk = _head[_head["q124"]].set_index(["game_id", "chain_id"])
+_passes = (tc.completed_pass(_ct) & ~_ct["q124"]).groupby(_ck).sum()
+_dur = _ct.groupby(_ck)["time"].agg(lambda t: t.max() - t.min())
+_gk = _gk.assign(buildup=(_passes.reindex(_gk.index) >= 4) & (_dur.reindex(_gk.index) >= 8))
 variable_ps17 = (
-    _per_kick.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        total_goal_kicks=("kick_id", "size"),
-        successful_buildups=("established", "sum"),
-    )
+    _gk.reset_index().groupby(["game_id", "team_id"])["buildup"].mean().mul(100.0).rename("buildup_%").reset_index()
 )
-variable_ps17["successful_buildups"] = variable_ps17["successful_buildups"].astype(int)
-variable_ps17["buildup_%"] = np.where(
-    variable_ps17["total_goal_kicks"] > 0,
-    variable_ps17["successful_buildups"] / variable_ps17["total_goal_kicks"] * 100,
-    np.nan,
-)
-
-variable_ps17 = variable_ps17[
-    ["game_id", "team_id", "total_goal_kicks", "successful_buildups", "buildup_%"]
-]
 
 variable_ps = variable_ps.merge(
     variable_ps17[["game_id", "team_id", "buildup_%"]],
@@ -7570,37 +3706,14 @@ variable_ps = variable_ps.merge(
 # Variáveis
 # 18
 # Progressive passes from middle third %
-"""Progressive Passes From Middle Third % is the share of a team's
-open-play pass attempts originating in the middle third of the pitch
-that are progressive. It is a measure of forward intent through the
-central phase of buildup.
+"""Progressive Passes From Middle Third % is the share of a team's open-play pass attempts starting in the middle
+third (100/3 <= start_x < 200/3) that are progressive. It measures forward intent in the central phase of build-up.
 
-Pass mask (open-play attempts, any outcome):
-  type_id == 1
-  AND NOT qualifier 5   (Free kick taken)
-  AND NOT qualifier 6   (Corner taken)
-  AND NOT qualifier 107 (Throw-in)
-Outcome is NOT filtered: `progressive_pass` (built in the MA
-infrastructure as type_id==1 & length >= 10m & forward_ratio >= 25%)
-is itself outcome-agnostic -- a failed forward long ball still counts
-as an attempted progression. The metric measures tactical choice /
-forward intent, not completion success.
-
-Middle third: start_x in [100/3, 200/3), i.e. [~33.33, ~66.67).
-Opta F24 Appendix 11 normalizes every event left-to-right in the
-event team's attacking direction, so the middle third is a literal
-constant interval -- NOT a statistic computed from observed pass
-coordinates, which was the prior implementation's bug (it rederived
-the boundaries from `passes['start_x'].min()/.max()`, which drifted
-the third's location based on which zones the team passed from).
-
-Numerator:   middle-third passes flagged as progressive.
-Denominator: all middle-third open-play pass attempts.
-Ratio * 100.
-
-`progressive_pass` column source: MatchAnalysis_PlayStyle_2026.py
-infrastructure (line ~463), which defines progressive = (type_id==1)
-& (pass_length >= 10m) & (forward_progress_ratio >= 25%).
+Pass mask: type_id 1, any outcome (a failed forward pass is still an attempted progression), without free kicks
+(q5), corners (q6) or throw-ins (q107).
+Progressive: the reference progressive() rule (D1) -- length >= 10 Opta units and x gain >= 25% of the distance left
+to the goal line (progcarry_df["progressive_pass"]).
+Ratio * 100; NaN when the team has no middle-third pass.
 """
 
 MIDDLE_THIRD_START = 100.0 / 3.0
@@ -7648,6 +3761,18 @@ variable_ps = variable_ps.merge(
 
 ###############################################################################
 ###############################################################################
+# First action of each chain that reaches the final third / the box (D2) — the "entry" event.
+_ct7 = progcarry_df[progcarry_df["is_chain_team"].fillna(False).astype(bool) & progcarry_df["chain_id"].notna()]
+_ck7 = ["game_id", "chain_id"]
+_entry_third = _ct7[tc.zone_hits(_ct7, "third")].groupby(_ck7, sort=False).head(1)
+_entry_box = _ct7[tc.zone_hits(_ct7, "box")].groupby(_ck7, sort=False).head(1)
+_from_outside_third = CHAINS.loc[~CHAINS["starts_in_third"], _ck7]
+_from_outside_box = CHAINS.loc[~CHAINS["starts_in_box"], _ck7]
+_entry_third = _entry_third.merge(_from_outside_third, on=_ck7)
+_entry_box = _entry_box.merge(_from_outside_box, on=_ck7)
+_ft_entries = _entry_third.groupby(["game_id", "team_id"]).size().rename("ft_entries")
+_open = ~progcarry_df[["q5", "q6", "q107"]].any(axis=1)
+
 # Variáveis
 # 19
 # Crosses per final third entry
@@ -7696,53 +3821,12 @@ Fixes versus the prior implementation:
       numerator and denominator share a coherent spatial scope.
 """
 
-FINAL_THIRD = 200.0 / 3.0
-
-_outcome_v19 = progcarry_df["outcome"].astype(bool)
-_is_set_piece_v19 = progcarry_df["qualifiers"].apply(
-    lambda q: has_qualifier(q, 5) or has_qualifier(q, 6) or has_qualifier(q, 107)
-)
-_is_cross_v19 = progcarry_df["qualifiers"].apply(lambda q: has_qualifier(q, 2))
-
-_entry_mask_v19 = (
-    progcarry_df["type_id"].isin([1, 2000])
-    & _outcome_v19
-    & (progcarry_df["start_x"] < FINAL_THIRD)
-    & (progcarry_df["end_x"] >= FINAL_THIRD)
-)
-
-_cross_mask_v19 = (
-    (progcarry_df["type_id"] == 1)
-    & _is_cross_v19
-    & (progcarry_df["start_x"] >= FINAL_THIRD)
-    & ~_is_set_piece_v19
-)
-
-_entries_v19 = progcarry_df.loc[_entry_mask_v19, ["game_id", "team_id"]]
-_crosses_v19 = progcarry_df.loc[_cross_mask_v19, ["game_id", "team_id"]]
-
-_entry_counts_v19 = (
-    _entries_v19.groupby(["game_id", "team_id"]).size().rename("total_final_third_entries")
-)
-_cross_counts_v19 = (
-    _crosses_v19.groupby(["game_id", "team_id"]).size().rename("total_crosses")
-)
-
-variable_ps19 = (
-    pd.concat([_entry_counts_v19, _cross_counts_v19], axis=1)
-    .fillna(0)
-    .astype(int)
-    .reset_index()
-)
+_cross = progcarry_df[(progcarry_df["type_id"] == 1) & progcarry_df["q2"] & _open
+                      & tc.in_final_third(progcarry_df["start_x"])]
+_c19 = _cross.groupby(["game_id", "team_id"]).size().rename("crosses")
+variable_ps19 = pd.concat([_c19, _ft_entries], axis=1).reset_index()
 variable_ps19["crosses_per_final_third_entry"] = np.where(
-    variable_ps19["total_final_third_entries"] > 0,
-    variable_ps19["total_crosses"] / variable_ps19["total_final_third_entries"],
-    np.nan,
-)
-
-variable_ps19 = variable_ps19[
-    ["game_id", "team_id", "total_crosses", "total_final_third_entries", "crosses_per_final_third_entry"]
-]
+    variable_ps19["ft_entries"] > 0, variable_ps19["crosses"].fillna(0) / variable_ps19["ft_entries"], np.nan)
 
 variable_ps = variable_ps.merge(
     variable_ps19[["game_id", "team_id", "crosses_per_final_third_entry"]],
@@ -7789,47 +3873,11 @@ Fixes versus the prior implementation:
       above.
 """
 
-FINAL_THIRD = 200.0 / 3.0
-
-_outcome_v20 = progcarry_df["outcome"].astype(bool)
-
-_entry_mask_v20 = (
-    progcarry_df["type_id"].isin([1, 2000])
-    & _outcome_v20
-    & (progcarry_df["start_x"] < FINAL_THIRD)
-    & (progcarry_df["end_x"] >= FINAL_THIRD)
-)
-
-_dribble_mask_v20 = (
-    (progcarry_df["type_id"] == 3)
-    & (progcarry_df["start_x"] >= FINAL_THIRD)
-)
-
-_entries_v20 = progcarry_df.loc[_entry_mask_v20, ["game_id", "team_id"]]
-_dribbles_v20 = progcarry_df.loc[_dribble_mask_v20, ["game_id", "team_id"]]
-
-_entry_counts_v20 = (
-    _entries_v20.groupby(["game_id", "team_id"]).size().rename("total_final_third_entries")
-)
-_dribble_counts_v20 = (
-    _dribbles_v20.groupby(["game_id", "team_id"]).size().rename("total_final_third_dribbles")
-)
-
-variable_ps20 = (
-    pd.concat([_entry_counts_v20, _dribble_counts_v20], axis=1)
-    .fillna(0)
-    .astype(int)
-    .reset_index()
-)
+_drib = progcarry_df[(progcarry_df["type_id"] == 3) & tc.in_final_third(progcarry_df["start_x"])]  # attempts
+_d20 = _drib.groupby(["game_id", "team_id"]).size().rename("dribbles")
+variable_ps20 = pd.concat([_d20, _ft_entries], axis=1).reset_index()
 variable_ps20["dribbles_per_final_third_entry"] = np.where(
-    variable_ps20["total_final_third_entries"] > 0,
-    variable_ps20["total_final_third_dribbles"] / variable_ps20["total_final_third_entries"],
-    np.nan,
-)
-
-variable_ps20 = variable_ps20[
-    ["game_id", "team_id", "total_final_third_dribbles", "total_final_third_entries", "dribbles_per_final_third_entry"]
-]
+    variable_ps20["ft_entries"] > 0, variable_ps20["dribbles"].fillna(0) / variable_ps20["ft_entries"], np.nan)
 
 variable_ps = variable_ps.merge(
     variable_ps20[["game_id", "team_id", "dribbles_per_final_third_entry"]],
@@ -7915,69 +3963,10 @@ Fixes versus the prior implementation:
       denominator without contributing to the numerator.
 """
 
-BOX_X = 83.0
-BOX_Y_MIN = 21.1
-BOX_Y_MAX = 78.9
-
-_outcome_v21 = progcarry_df["outcome"].astype(bool)
-_is_set_piece_v21 = progcarry_df["qualifiers"].apply(
-    lambda q: has_qualifier(q, 5) or has_qualifier(q, 6) or has_qualifier(q, 107)
-)
-_is_cross_v21 = progcarry_df["qualifiers"].apply(lambda q: has_qualifier(q, 2))
-
-_start_in_box_v21 = (
-    (progcarry_df["start_x"] >= BOX_X)
-    & (progcarry_df["start_y"] >= BOX_Y_MIN)
-    & (progcarry_df["start_y"] <= BOX_Y_MAX)
-)
-_end_in_box_v21 = (
-    (progcarry_df["end_x"] >= BOX_X)
-    & (progcarry_df["end_y"] >= BOX_Y_MIN)
-    & (progcarry_df["end_y"] <= BOX_Y_MAX)
-)
-
-_box_entry_mask_v21 = (
-    progcarry_df["type_id"].isin([1, 1000, 2000])
-    & _outcome_v21
-    & ~_is_set_piece_v21
-    & ~_start_in_box_v21
-    & _end_in_box_v21
-)
-
-_cross_entry_mask_v21 = (
-    (progcarry_df["type_id"] == 1)
-    & _outcome_v21
-    & _is_cross_v21
-    & ~_is_set_piece_v21
-    & ~_start_in_box_v21
-    & _end_in_box_v21
-)
-
-_entries_v21 = progcarry_df.loc[_box_entry_mask_v21, ["game_id", "team_id"]]
-_cross_entries_v21 = progcarry_df.loc[_cross_entry_mask_v21, ["game_id", "team_id"]]
-
-_entry_counts_v21 = (
-    _entries_v21.groupby(["game_id", "team_id"]).size().rename("total_box_entries")
-)
-_cross_counts_v21 = (
-    _cross_entries_v21.groupby(["game_id", "team_id"]).size().rename("box_entries_from_crosses_count")
-)
-
 variable_ps21 = (
-    pd.concat([_entry_counts_v21, _cross_counts_v21], axis=1)
-    .fillna(0)
-    .astype(int)
-    .reset_index()
+    _entry_box.assign(cross=(_entry_box["type_id"] == 1) & _entry_box["q2"])
+    .groupby(["game_id", "team_id"])["cross"].mean().mul(100.0).rename("box_entries_from_crosses").reset_index()
 )
-variable_ps21["box_entries_from_crosses"] = np.where(
-    variable_ps21["total_box_entries"] > 0,
-    variable_ps21["box_entries_from_crosses_count"] / variable_ps21["total_box_entries"] * 100,
-    np.nan,
-)
-
-variable_ps21 = variable_ps21[
-    ["game_id", "team_id", "total_box_entries", "box_entries_from_crosses_count", "box_entries_from_crosses"]
-]
 
 variable_ps = variable_ps.merge(
     variable_ps21[["game_id", "team_id", "box_entries_from_crosses"]],
@@ -8055,67 +4044,10 @@ Fixes versus the prior implementation:
       team's in-play tactical pattern.
 """
 
-BOX_X = 83.0
-BOX_Y_MIN = 21.1
-BOX_Y_MAX = 78.9
-
-_outcome_v22 = progcarry_df["outcome"].astype(bool)
-_is_set_piece_v22 = progcarry_df["qualifiers"].apply(
-    lambda q: has_qualifier(q, 5) or has_qualifier(q, 6) or has_qualifier(q, 107)
-)
-
-_start_in_box_v22 = (
-    (progcarry_df["start_x"] >= BOX_X)
-    & (progcarry_df["start_y"] >= BOX_Y_MIN)
-    & (progcarry_df["start_y"] <= BOX_Y_MAX)
-)
-_end_in_box_v22 = (
-    (progcarry_df["end_x"] >= BOX_X)
-    & (progcarry_df["end_y"] >= BOX_Y_MIN)
-    & (progcarry_df["end_y"] <= BOX_Y_MAX)
-)
-
-_box_entry_mask_v22 = (
-    progcarry_df["type_id"].isin([1, 1000, 2000])
-    & _outcome_v22
-    & ~_is_set_piece_v22
-    & ~_start_in_box_v22
-    & _end_in_box_v22
-)
-
-_carry_entry_mask_v22 = (
-    progcarry_df["type_id"].isin([3, 1000, 2000])
-    & _outcome_v22
-    & ~_is_set_piece_v22
-    & ~_start_in_box_v22
-    & _end_in_box_v22
-)
-
-_entries_v22 = progcarry_df.loc[_box_entry_mask_v22, ["game_id", "team_id"]]
-_carry_entries_v22 = progcarry_df.loc[_carry_entry_mask_v22, ["game_id", "team_id"]]
-
-_entry_counts_v22 = (
-    _entries_v22.groupby(["game_id", "team_id"]).size().rename("total_box_entries")
-)
-_carry_counts_v22 = (
-    _carry_entries_v22.groupby(["game_id", "team_id"]).size().rename("box_entries_from_carries_count")
-)
-
 variable_ps22 = (
-    pd.concat([_entry_counts_v22, _carry_counts_v22], axis=1)
-    .fillna(0)
-    .astype(int)
-    .reset_index()
+    _entry_box.assign(carry=_entry_box["type_id"].isin(tc.CARRY_TYPES))
+    .groupby(["game_id", "team_id"])["carry"].mean().mul(100.0).rename("box_entries_from_carries").reset_index()
 )
-variable_ps22["box_entries_from_carries"] = np.where(
-    variable_ps22["total_box_entries"] > 0,
-    variable_ps22["box_entries_from_carries_count"] / variable_ps22["total_box_entries"] * 100,
-    np.nan,
-)
-
-variable_ps22 = variable_ps22[
-    ["game_id", "team_id", "total_box_entries", "box_entries_from_carries_count", "box_entries_from_carries"]
-]
 
 variable_ps = variable_ps.merge(
     variable_ps22[["game_id", "team_id", "box_entries_from_carries"]],
@@ -8127,173 +4059,33 @@ variable_ps = variable_ps.merge(
 ###############################################################################
 ###############################################################################
 ###############################################################################
+# Open-play shots (B5): np shots (no q9 penalty, no q28 own goal) that are not set-piece shots (q24/q25/q26), each
+# measured inside its own reference chain: seconds since the chain's first chain-team event and passes before it.
+_ct9 = progcarry_df[progcarry_df["is_chain_team"].fillna(False).astype(bool) & progcarry_df["chain_id"].notna()]
+_ct9 = _ct9.assign(_start=_ct9.groupby(["game_id", "chain_id"])["time"].transform("min"),
+                   _passes_before=(_ct9["type_id"] == 1).astype(int).groupby([_ct9["game_id"], _ct9["chain_id"]]).cumsum()
+                                  - (_ct9["type_id"] == 1).astype(int))
+OPEN_SHOTS = _ct9[tc.npxg_shots(_ct9) & ~_ct9[["q24", "q25", "q26"]].any(axis=1)].assign(
+    duration=lambda d: d["time"] - d["_start"])
+
 # Variáveis
 # Chance creation
 # 23
 # Shots from sustained attacks %
-"""Shots from Sustained Attacks % is the share of a team's open-play
-shots (excluding penalties) that conclude a methodical possession:
-    duration >= 9 seconds AND >= 4 successful open-play passes
-between the team's most recent recovery (or period start) and the
-shot. It isolates shots created through patient build-up from those
-created through transitions, direct play, or set-piece chaos.
+"""Shots from Sustained Attacks % is the share of a team's open-play shots that end a patient possession: the
+shot comes >= 9 s after the start of its reference possession chain and after >= 4 passes of that chain.
 
-Shot events (Opta F24 Appendix 1):
-  type_id 13  Miss
-  type_id 14  Post
-  type_id 15  Attempt Saved
-  type_id 16  Goal
-  Exclude penalties via qualifier 9 (Opta F24 Appendix 2).
-
-Possession start: the shot-taking team's most recent canonical
-recovery in the same period (backward asof join on the shared
-recovery mask {49, 7&won, 8, 44&won, 11&won}). If no recovery exists
-in the period before the shot -- e.g. a shot built directly from the
-kickoff -- the possession start is time = 0 in per-period seconds.
-
-Pass counting: successful same-team open-play passes within
-[possession_start, shot_time). Set-pieces (qualifiers 5/6/107) are
-excluded so a set-piece restart followed by 3 open-play passes and a
-shot does NOT qualify as "sustained". No explicit "consecutive"
-logic: the possession_start bound guarantees no intervening same-
-team loss (if there were one, a later recovery would exist and
-merge_asof would pick that later recovery as possession_start).
-
-Fixes versus the prior implementation:
-  (1) The old code ran on progcarry_df2 (passes-only). Shot events
-      (type_id 13/14/15/16) are NOT passes and therefore absent from
-      progcarry_df2 -- the shot list was always empty, and the metric
-      always returned 0.
-  (2) Docstring said "4 consecutive completed passes" but the code
-      checked >= 5. The 4-pass threshold is used here, matching the
-      docstring and the Opta / Wyscout convention for build-up /
-      sustained-attack definitions.
-  (3) possessionId dependency replaced with the canonical recovery
-      mask + merge_asof, same machinery used in Vars 6/7/8/11/12/17.
-  (4) Penalty-qualifier check rewritten to use has_qualifier (same
-      helper used across Vars 8/12/17/19); old code assumed a dict
-      shape that may not match the qualifiers-column serialization.
-
-Implementation: vectorized via merge + range-filter.
-  - _shots annotated with their possession_start via backward asof
-    to canonical recoveries; NaN -> 0 (period-start fallback).
-  - Inner-merge passes x shots on (game_id, team_id, period_id),
-    then filter to pass_time in [possession_start, shot_time) and
-    groupby-shot to count.
-  - Per shot: sustained iff pass_count >= 4 AND duration >= 9s.
-  - Per team-game: (sustained_shots / total_shots) * 100.
+Shots (B5, OPEN_SHOTS): np shots (types 13-16 without penalties q9 or own goals q28), excluding set-piece shots
+(q24/q25/q26). Each shot is measured inside its own reference chain: duration = shot time - time of the chain's
+first chain-team event; passes = chain-team passes (type 1, any outcome) before the shot.
+Ratio * 100; NaN when the team has no open-play shot.
 """
 
-MIN_PASSES_FOR_SUSTAINED = 4
-MIN_SECONDS_FOR_SUSTAINED = 9.0
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | (_type_id == 8)
-    | ((_type_id == 44) & _outcome)
-    | ((_type_id == 11) & _outcome)
-)
-
-_is_set_piece_v23 = progcarry_df["qualifiers"].apply(
-    lambda q: has_qualifier(q, 5) or has_qualifier(q, 6) or has_qualifier(q, 107)
-)
-_is_penalty_v23 = progcarry_df["qualifiers"].apply(
-    lambda q: has_qualifier(q, 9)
-)
-
-_shot_mask_v23 = (
-    progcarry_df["type_id"].isin([13, 14, 15, 16])
-    & ~_is_penalty_v23
-)
-
-_pass_mask_v23 = (
-    (progcarry_df["type_id"] == 1)
-    & _outcome
-    & ~_is_set_piece_v23
-)
-
-_shots_v23 = (
-    progcarry_df.loc[_shot_mask_v23, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "shot_time"})
-    .sort_values("shot_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-_shots_v23["shot_id"] = _shots_v23.index
-
-_recoveries_v23 = (
-    progcarry_df.loc[_recovery_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_passes_v23 = (
-    progcarry_df.loc[_pass_mask_v23, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "pass_time"})
-    .sort_values("pass_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-# Possession start per shot: most recent same-team recovery in same period.
-# allow_exact_matches=False ensures recovery strictly precedes shot.
-_shot_with_rec = pd.merge_asof(
-    _shots_v23,
-    _recoveries_v23,
-    left_on="shot_time",
-    right_on="recovery_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="backward",
-    allow_exact_matches=False,
-)
-# NaN recovery_time -> period start (0 in per-period seconds).
-_shot_with_rec["possession_start"] = _shot_with_rec["recovery_time"].fillna(0.0)
-_shot_with_rec["duration"] = _shot_with_rec["shot_time"] - _shot_with_rec["possession_start"]
-
-# Count passes per shot: inner-merge passes x shots on (game, team, period),
-# then filter passes inside the possession window and groupby shot.
-_pass_shot_join = _passes_v23.merge(
-    _shot_with_rec[["shot_id", "game_id", "team_id", "period_id", "shot_time", "possession_start"]],
-    on=["game_id", "team_id", "period_id"],
-    how="inner",
-)
-_valid_passes = _pass_shot_join[
-    (_pass_shot_join["pass_time"] >= _pass_shot_join["possession_start"])
-    & (_pass_shot_join["pass_time"] < _pass_shot_join["shot_time"])
-]
-_pass_counts_v23 = (
-    _valid_passes.groupby("shot_id", as_index=False).size().rename(columns={"size": "pass_count"})
-)
-
-_shot_with_rec = _shot_with_rec.merge(_pass_counts_v23, on="shot_id", how="left")
-_shot_with_rec["pass_count"] = _shot_with_rec["pass_count"].fillna(0).astype(int)
-_shot_with_rec["sustained"] = (
-    (_shot_with_rec["pass_count"] >= MIN_PASSES_FOR_SUSTAINED)
-    & (_shot_with_rec["duration"] >= MIN_SECONDS_FOR_SUSTAINED)
-)
-
+# % of open-play shots from sustained possessions: chain >= 9 s old and >= 4 passes before the shot.
 variable_ps23 = (
-    _shot_with_rec.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        total_shots=("shot_id", "size"),
-        shots_from_sustained_attacks=("sustained", "sum"),
-    )
+    OPEN_SHOTS.assign(s=(OPEN_SHOTS["duration"] >= 9) & (OPEN_SHOTS["_passes_before"] >= 4))
+    .groupby(["game_id", "team_id"])["s"].mean().mul(100.0).rename("sustained_attacks").reset_index()
 )
-variable_ps23["shots_from_sustained_attacks"] = (
-    variable_ps23["shots_from_sustained_attacks"].astype(int)
-)
-variable_ps23["sustained_attacks"] = np.where(
-    variable_ps23["total_shots"] > 0,
-    variable_ps23["shots_from_sustained_attacks"] / variable_ps23["total_shots"] * 100,
-    np.nan,
-)
-
-variable_ps23 = variable_ps23[
-    ["game_id", "team_id", "total_shots", "shots_from_sustained_attacks", "sustained_attacks"]
-]
 
 variable_ps = variable_ps.merge(
     variable_ps23[["game_id", "team_id", "sustained_attacks"]],
@@ -8306,145 +4098,19 @@ variable_ps = variable_ps.merge(
 # Variáveis
 # 24
 # Shots from direct attacks %
-"""Shots from Direct Attacks % is the share of a team's open-play shots
-(excluding penalties) that conclude a rapid, minimal-passing attack:
-    duration <= 8 seconds AND <= 3 successful open-play passes
-between the team's most recent recovery (or period start) and the
-shot. The mirror of Var 23 (sustained attacks). Together they form a
-mutually exclusive decomposition on both axes (duration and pass
-count), so a shot cannot be counted as both sustained and direct.
+"""Shots from Direct Attacks % is the share of a team's open-play shots that end a quick possession: the shot comes
+<= 8 s after the start of its reference possession chain and after <= 3 passes of that chain. The mirror of Var 23
+(sustained attacks): a shot cannot be both, so the two shares add up to 100 or less.
 
-All building blocks are identical to Var 23 -- see that section's
-docstring for full rationale. The only parameter differences are:
-  - duration threshold inverted: <= 8s (direct) vs >= 9s (sustained)
-  - pass-count threshold inverted: <= 3 (direct) vs >= 4 (sustained)
-
-Fixes versus the prior implementation:
-  (1) The old code ran on progcarry_df2 (passes-only). Shot events
-      (type_id 13/14/15/16) are NOT passes and were absent, so the
-      shot list was always empty and the metric always returned 0.
-      Same silent-kill bug as Var 23.
-  (2) Docstring said "max 3 passes", code checked <= 4. The 3-pass
-      threshold is used here, matching the docstring and making the
-      sustained/direct decomposition internally consistent.
-  (3) Old code counted ALL events in the possession chain (.size()
-      on grouped events) as "passes" -- it was actually counting
-      passes + recoveries + fouls + ball touches. Replaced with an
-      explicit pass count (successful type_id==1, set-pieces excluded),
-      matching Var 23's definition.
-  (4) possessionId dependency replaced with canonical recovery-mask
-      merge_asof, identical machinery to Vars 7/8/11/12/17/23.
-  (5) Penalty-qualifier check uses has_qualifier helper (same as
-      Vars 8/12/17/19/23).
+Shots and chain measures: see Var 23 (OPEN_SHOTS, B5).
+Ratio * 100; NaN when the team has no open-play shot.
 """
 
-MAX_PASSES_FOR_DIRECT = 3
-MAX_SECONDS_FOR_DIRECT = 8.0
-
-_type_id = progcarry_df["type_id"]
-_outcome = progcarry_df["outcome"].astype(bool)
-
-_recovery_mask = (
-    (_type_id == 49)
-    | ((_type_id == 7) & _outcome)
-    | (_type_id == 8)
-    | ((_type_id == 44) & _outcome)
-    | ((_type_id == 11) & _outcome)
-)
-
-_is_set_piece_v24 = progcarry_df["qualifiers"].apply(
-    lambda q: has_qualifier(q, 5) or has_qualifier(q, 6) or has_qualifier(q, 107)
-)
-_is_penalty_v24 = progcarry_df["qualifiers"].apply(
-    lambda q: has_qualifier(q, 9)
-)
-
-_shot_mask_v24 = (
-    progcarry_df["type_id"].isin([13, 14, 15, 16])
-    & ~_is_penalty_v24
-)
-
-_pass_mask_v24 = (
-    (progcarry_df["type_id"] == 1)
-    & _outcome
-    & ~_is_set_piece_v24
-)
-
-_shots_v24 = (
-    progcarry_df.loc[_shot_mask_v24, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "shot_time"})
-    .sort_values("shot_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-_shots_v24["shot_id"] = _shots_v24.index
-
-_recoveries_v24 = (
-    progcarry_df.loc[_recovery_mask, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "recovery_time"})
-    .sort_values("recovery_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_passes_v24 = (
-    progcarry_df.loc[_pass_mask_v24, ["game_id", "team_id", "period_id", "time"]]
-    .rename(columns={"time": "pass_time"})
-    .sort_values("pass_time", kind="mergesort")
-    .reset_index(drop=True)
-)
-
-_shot_with_rec_v24 = pd.merge_asof(
-    _shots_v24,
-    _recoveries_v24,
-    left_on="shot_time",
-    right_on="recovery_time",
-    by=["game_id", "team_id", "period_id"],
-    direction="backward",
-    allow_exact_matches=False,
-)
-_shot_with_rec_v24["possession_start"] = _shot_with_rec_v24["recovery_time"].fillna(0.0)
-_shot_with_rec_v24["duration"] = (
-    _shot_with_rec_v24["shot_time"] - _shot_with_rec_v24["possession_start"]
-)
-
-_pass_shot_join_v24 = _passes_v24.merge(
-    _shot_with_rec_v24[["shot_id", "game_id", "team_id", "period_id", "shot_time", "possession_start"]],
-    on=["game_id", "team_id", "period_id"],
-    how="inner",
-)
-_valid_passes_v24 = _pass_shot_join_v24[
-    (_pass_shot_join_v24["pass_time"] >= _pass_shot_join_v24["possession_start"])
-    & (_pass_shot_join_v24["pass_time"] < _pass_shot_join_v24["shot_time"])
-]
-_pass_counts_v24 = (
-    _valid_passes_v24.groupby("shot_id", as_index=False).size().rename(columns={"size": "pass_count"})
-)
-
-_shot_with_rec_v24 = _shot_with_rec_v24.merge(_pass_counts_v24, on="shot_id", how="left")
-_shot_with_rec_v24["pass_count"] = _shot_with_rec_v24["pass_count"].fillna(0).astype(int)
-_shot_with_rec_v24["direct"] = (
-    (_shot_with_rec_v24["pass_count"] <= MAX_PASSES_FOR_DIRECT)
-    & (_shot_with_rec_v24["duration"] <= MAX_SECONDS_FOR_DIRECT)
-)
-
+# % of open-play shots from direct attacks: chain <= 8 s old and <= 3 passes before the shot.
 variable_ps24 = (
-    _shot_with_rec_v24.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        total_shots=("shot_id", "size"),
-        shots_from_direct_attacks=("direct", "sum"),
-    )
+    OPEN_SHOTS.assign(d=(OPEN_SHOTS["duration"] <= 8) & (OPEN_SHOTS["_passes_before"] <= 3))
+    .groupby(["game_id", "team_id"])["d"].mean().mul(100.0).rename("direct_attack").reset_index()
 )
-variable_ps24["shots_from_direct_attacks"] = (
-    variable_ps24["shots_from_direct_attacks"].astype(int)
-)
-variable_ps24["direct_attack"] = np.where(
-    variable_ps24["total_shots"] > 0,
-    variable_ps24["shots_from_direct_attacks"] / variable_ps24["total_shots"] * 100,
-    np.nan,
-)
-
-variable_ps24 = variable_ps24[
-    ["game_id", "team_id", "total_shots", "shots_from_direct_attacks", "direct_attack"]
-]
 
 variable_ps = variable_ps.merge(
     variable_ps24[["game_id", "team_id", "direct_attack"]],
@@ -8494,55 +4160,12 @@ Fixes versus the prior implementation:
       framing consistency with Vars 18/19/21/22/23/24.
 """
 
-FINAL_THIRD = 200.0 / 3.0
-
-_outcome_v25 = progcarry_df["outcome"].astype(bool)
-_is_set_piece_v25 = progcarry_df["qualifiers"].apply(
-    lambda q: has_qualifier(q, 5) or has_qualifier(q, 6) or has_qualifier(q, 107)
-)
-_is_penalty_v25 = progcarry_df["qualifiers"].apply(
-    lambda q: has_qualifier(q, 9)
-)
-
-_shot_mask_v25 = (
-    progcarry_df["type_id"].isin([13, 14, 15, 16])
-    & ~_is_penalty_v25
-)
-
-_final_third_pass_mask_v25 = (
-    (progcarry_df["type_id"] == 1)
-    & _outcome_v25
-    & (progcarry_df["end_x"] >= FINAL_THIRD)
-    & ~_is_set_piece_v25
-)
-
-_shots_v25 = progcarry_df.loc[_shot_mask_v25, ["game_id", "team_id"]]
-_final_third_passes_v25 = progcarry_df.loc[
-    _final_third_pass_mask_v25, ["game_id", "team_id"]
-]
-
-_shot_counts_v25 = (
-    _shots_v25.groupby(["game_id", "team_id"]).size().rename("total_shots")
-)
-_ftp_counts_v25 = (
-    _final_third_passes_v25.groupby(["game_id", "team_id"]).size().rename("final_third_passes")
-)
-
-variable_ps25 = (
-    pd.concat([_shot_counts_v25, _ftp_counts_v25], axis=1)
-    .fillna(0)
-    .astype(int)
-    .reset_index()
-)
+_s25 = progcarry_df[tc.npxg_shots(progcarry_df)].groupby(["game_id", "team_id"]).size().rename("shots")
+_p25 = progcarry_df[(progcarry_df["type_id"] == 1) & ~progcarry_df[["q5", "q6", "q107"]].any(axis=1)
+                    & tc.in_final_third(progcarry_df["end_x"])].groupby(["game_id", "team_id"]).size().rename("passes")
+variable_ps25 = pd.concat([_s25, _p25], axis=1).rename_axis(["game_id", "team_id"]).reset_index()
 variable_ps25["shots_per_final_third_pass"] = np.where(
-    variable_ps25["final_third_passes"] > 0,
-    variable_ps25["total_shots"] / variable_ps25["final_third_passes"],
-    np.nan,
-)
-
-variable_ps25 = variable_ps25[
-    ["game_id", "team_id", "total_shots", "final_third_passes", "shots_per_final_third_pass"]
-]
+    variable_ps25["passes"] > 0, variable_ps25["shots"].fillna(0) / variable_ps25["passes"], np.nan)
 
 variable_ps = variable_ps.merge(
     variable_ps25[["game_id", "team_id", "shots_per_final_third_pass"]],
@@ -8583,43 +4206,11 @@ Fixes versus the prior implementation:
       for consistency with Vars 8/12/17/19/23/24/25.
 """
 
-BOX_X = 83.0
-BOX_Y_MIN = 21.1
-BOX_Y_MAX = 78.9
-
-_is_penalty_v26 = progcarry_df["qualifiers"].apply(
-    lambda q: has_qualifier(q, 9)
-)
-
-_shot_mask_v26 = (
-    progcarry_df["type_id"].isin([13, 14, 15, 16])
-    & ~_is_penalty_v26
-)
-
-_shots_v26 = progcarry_df.loc[_shot_mask_v26, ["game_id", "team_id", "start_x", "start_y"]].copy()
-_shots_v26["is_outside_box"] = (
-    (_shots_v26["start_x"] < BOX_X)
-    | (_shots_v26["start_y"] < BOX_Y_MIN)
-    | (_shots_v26["start_y"] > BOX_Y_MAX)
-).astype(int)
-
+_s26 = progcarry_df[tc.npxg_shots(progcarry_df)]
 variable_ps26 = (
-    _shots_v26.groupby(["game_id", "team_id"], as_index=False)
-    .agg(
-        total_shots=("start_x", "size"),
-        outside_box_shots=("is_outside_box", "sum"),
-    )
+    _s26.assign(out=~tc.in_box(_s26["start_x"], _s26["start_y"]))
+    .groupby(["game_id", "team_id"])["out"].mean().mul(100.0).rename("shots_outside_box").reset_index()
 )
-variable_ps26["outside_box_shots"] = variable_ps26["outside_box_shots"].astype(int)
-variable_ps26["shots_outside_box"] = np.where(
-    variable_ps26["total_shots"] > 0,
-    variable_ps26["outside_box_shots"] / variable_ps26["total_shots"] * 100,
-    np.nan,
-)
-
-variable_ps26 = variable_ps26[
-    ["game_id", "team_id", "total_shots", "outside_box_shots", "shots_outside_box"]
-]
 
 variable_ps = variable_ps.merge(
     variable_ps26[["game_id", "team_id", "shots_outside_box"]],
@@ -8642,9 +4233,6 @@ variable_ps = variable_ps.merge(
 # Copying 
 variable_ps_new = variable_ps.copy()
 
-# Since all NaN are 0...
-# 1. Replace all NaN with 0 (since you confirmed NaN means zero in your data)
-variable_ps_new = variable_ps_new.fillna(0)
 
 
 # Add per-team possession percentages to variable_ps_new.
@@ -8805,61 +4393,31 @@ variable_ps_team_z.reset_index(drop=True, inplace=True)
 ###########################################################################
 ###########################################################################
 
-# Inverting the sign of inverted metrics
-# All metrics in variable_ps_team_z follow the "higher = better" convention
-# after this block. The seven metrics below are natively "lower = better":
-#   - PPDA: lower passes-per-defensive-action = more aggressive press
-#   - avg_time_to_defensive_action: faster response = better
-#   - transition_vulnerability_index: less vulnerable = better
-#   - opposition_final_third_entries_10s: fewer opp transitions = better
-#   - opposition_box_entries_10s: fewer opp box threats = better
-#   - time_to_progression_seconds: faster own-half-to-opp-half = better
-#   - shots_outside_box: lower share of outside-box shots = better shot
-#     quality (higher xG per attempt). Added to the inversion so that
-#     chance_creation_z rewards teams that take shots closer to goal.
-variable_ps_team_z["PPDA_z"] = -1*variable_ps_team_z["PPDA_z"]
-variable_ps_team_z["avg_time_to_defensive_action_z"] = -1*variable_ps_team_z["avg_time_to_defensive_action_z"]
-variable_ps_team_z["transition_vulnerability_index_z"] = -1*variable_ps_team_z["transition_vulnerability_index_z"]
-variable_ps_team_z["opposition_final_third_entries_10s_z"] = -1*variable_ps_team_z["opposition_final_third_entries_10s_z"]
-variable_ps_team_z["opposition_box_entries_10s_z"] = -1*variable_ps_team_z["opposition_box_entries_10s_z"]
-variable_ps_team_z["time_to_progression_seconds_z"] = -1*variable_ps_team_z["time_to_progression_seconds_z"]
-variable_ps_team_z["shots_outside_box_z"] = -1*variable_ps_team_z["shots_outside_box_z"]
-
-###########################################################################
-###########################################################################
-# Creating qualities columns
-# Define the columns to average for each metric
-defence_metrics = ["defensive_height_z", "high_recoveries_%_z", "PPDA_z", "fouls_in_attacking_half_%_z",
-                   "defensive_intensity_z"]
-
-defensive_transition_metrics = ["avg_time_to_defensive_action_z", "counter_press_Success_Rate_%_z",
-                                "transition_vulnerability_index_z", "opposition_final_third_entries_10s_z",
-                                "opposition_box_entries_10s_z"]	
-
-attacking_transition_metrics = ["time_to_progression_seconds_z", "first_pass_forward_pct_z",
-                                "final_third_entries_10s_pct_z", "box_entries_10s_pct_z",
-                                "retained_possessions_5s_pct_z"]	
-
-attacking_metrics = ["long_ball_%_z", "buildup_%_z", "progressive_passes_%_z", 
-                     "crosses_per_final_third_entry_z", "dribbles_per_final_third_entry_z", 
-                     "box_entries_from_crosses_z", "box_entries_from_carries_z"]
-
-chance_creation_metrics = ["sustained_attacks_z", "direct_attack_z", 
-                           "shots_per_final_third_pass_z", "shots_outside_box_z"]
-	
-# Compute the arithmetic mean for each metric and assign to the respective column
-variable_ps_team_z["defence_z"] = variable_ps_team_z[defence_metrics].mean(axis=1)
-variable_ps_team_z["defensive_transition_z"] = variable_ps_team_z[defensive_transition_metrics].mean(axis=1)
-variable_ps_team_z["attacking_transition_z"] = variable_ps_team_z[attacking_transition_metrics].mean(axis=1)
-variable_ps_team_z["attacking_z"] = variable_ps_team_z[attacking_metrics].mean(axis=1)
-variable_ps_team_z["chance_creation_z"] = variable_ps_team_z[chance_creation_metrics].mean(axis=1)
+# D12/D13: play-style composites are behaviour axes, not quality: each averages its metrics' z-scores signed toward
+# a named pole (+ toward the pole, - away from it). Rest-defence outcomes (transition vulnerability, opponent entries
+# within 10 s) stay as columns but are not in any composite.
+STYLE_POLES = {
+    "defence_z": {"+": ["defensive_height_z", "high_recoveries_%_z", "fouls_in_attacking_half_%_z",
+                        "defensive_intensity_z"], "-": ["PPDA_z"]},
+    "defensive_transition_z": {"+": ["counter_press_Success_Rate_%_z"], "-": ["avg_time_to_defensive_action_z"]},
+    "attacking_transition_z": {"+": ["first_pass_forward_pct_z", "final_third_entries_10s_pct_z", "box_entries_10s_pct_z"],
+                               "-": ["time_to_progression_seconds_z", "retained_possessions_5s_pct_z"]},
+    "directness_z": {"+": ["long_ball_%_z", "progressive_passes_%_z"], "-": ["buildup_%_z"]},
+    "wide_play_z": {"+": ["crosses_per_final_third_entry_z", "box_entries_from_crosses_z"],
+                    "-": ["dribbles_per_final_third_entry_z", "box_entries_from_carries_z"]},
+    "chance_creation_z": {"+": ["direct_attack_z", "shots_per_final_third_pass_z", "shots_outside_box_z"],
+                          "-": ["sustained_attacks_z"]},
+}
+for _name, _p in STYLE_POLES.items():
+    _signed = pd.concat([variable_ps_team_z[_p["+"]], -variable_ps_team_z[_p["-"]]], axis=1)
+    variable_ps_team_z[_name] = _signed.mean(axis=1)
 
 # Get a list of the current columns
 cols = list(variable_ps_team_z.columns)
 
 # List of columns to be relocated
-cols_to_remove = ["defence_z", "defensive_transition_z", "attacking_transition_z", 
-                  "attacking_z", "chance_creation_z"]
+cols_to_remove = ["defence_z", "defensive_transition_z", "attacking_transition_z", "directness_z", "wide_play_z",
+                  "chance_creation_z"]
 
 # Remove these columns from the list
 for col in cols_to_remove:
@@ -8875,7 +4433,7 @@ variable_ps_team_z = variable_ps_team_z[cols]
 # Renaming columns
 columns_to_rename = ["round", "date", "fixture", "team_name",
                      "team_possession", "opponent_possession", "defence_z", "defensive_transition_z",
-                     "attacking_transition_z", "attacking_z", "chance_creation_z", "defensive_height_z", 
+                     "attacking_transition_z", "directness_z", "wide_play_z", "chance_creation_z", "defensive_height_z", 
                      "high_recoveries_%_z", "PPDA_z", "fouls_in_attacking_half_%_z","defensive_intensity_z",	
                      "avg_time_to_defensive_action_z", "counter_press_Success_Rate_%_z",
                      "transition_vulnerability_index_z", "opposition_final_third_entries_10s_z", 
@@ -8887,8 +4445,8 @@ columns_to_rename = ["round", "date", "fixture", "team_name",
                      ]
 
 columns_renamed = ["rodada", "data", "partida", "clube", "Posse (%)",
-                   "Posse adversário (%)", "Defesa", "Transição defensiva",
-                   "Transição ofensiva", "Ataque", "Criação de chances", 
+                   "Posse adversário (%)", "Bloco alto / agressivo", "Contrapressão imediata",
+                   "Transição vertical", "Jogo direto", "Jogo pelos lados", "Finalização precoce", 
                    "Altura defensiva (m)", "Recuperações de posse no último terço (%)", "PPDA", "Faltas no campo de ataque (%)",
                    "Intensidade defensiva", "Tempo médio ação defensiva (s)", "Sucesso da pressão pós perda (5s) (%)",
                    "Índice de Vulnerabilidade na Transição", "Entradas do adversário no último terço em 10s",
@@ -8900,6 +4458,7 @@ columns_renamed = ["rodada", "data", "partida", "clube", "Posse (%)",
                     ]
 
 # Create a dictionary mapping old names to new names
+assert len(columns_to_rename) == len(columns_renamed)
 rename_dict = dict(zip(columns_to_rename, columns_renamed))
 
 # Rename columns in variable_ps_team_z
@@ -8952,52 +4511,17 @@ variable_ps_round_z.reset_index(drop=True, inplace=True)
 ###########################################################################
 ###########################################################################
 
-# Inverting the sign of inverted metrics
-variable_ps_round_z["PPDA_z"] = -1*variable_ps_round_z["PPDA_z"]
-variable_ps_round_z["avg_time_to_defensive_action_z"] = -1*variable_ps_round_z["avg_time_to_defensive_action_z"]
-variable_ps_round_z["transition_vulnerability_index_z"] = -1*variable_ps_round_z["transition_vulnerability_index_z"]
-variable_ps_round_z["opposition_final_third_entries_10s_z"] = -1*variable_ps_round_z["opposition_final_third_entries_10s_z"]
-variable_ps_round_z["opposition_box_entries_10s_z"] = -1*variable_ps_round_z["opposition_box_entries_10s_z"]
-variable_ps_round_z["time_to_progression_seconds_z"] = -1*variable_ps_round_z["time_to_progression_seconds_z"]
-variable_ps_round_z["shots_outside_box_z"] = -1*variable_ps_round_z["shots_outside_box_z"]
-
-###########################################################################
-###########################################################################
-
-# Creating qualities columns
-# Define the columns to average for each metric
-defence_metrics = ["defensive_height_z", "high_recoveries_%_z", "PPDA_z", "fouls_in_attacking_half_%_z",
-                   "defensive_intensity_z"]
-
-defensive_transition_metrics = ["avg_time_to_defensive_action_z", "counter_press_Success_Rate_%_z",
-                                "transition_vulnerability_index_z", "opposition_final_third_entries_10s_z",
-                                "opposition_box_entries_10s_z"]	
-
-attacking_transition_metrics = ["time_to_progression_seconds_z", "first_pass_forward_pct_z",
-                                "final_third_entries_10s_pct_z", "box_entries_10s_pct_z",
-                                "retained_possessions_5s_pct_z"]	
-
-attacking_metrics = ["long_ball_%_z", "buildup_%_z", "progressive_passes_%_z", 
-                     "crosses_per_final_third_entry_z", "dribbles_per_final_third_entry_z", 
-                     "box_entries_from_crosses_z", "box_entries_from_carries_z"]
-
-chance_creation_metrics = ["sustained_attacks_z", "direct_attack_z", 
-                           "shots_per_final_third_pass_z", "shots_outside_box_z"]
-
-    
-# Compute the arithmetic mean for each metric and assign to the respective column
-variable_ps_round_z["defence_z"] = variable_ps_round_z[defence_metrics].mean(axis=1)
-variable_ps_round_z["defensive_transition_z"] = variable_ps_round_z[defensive_transition_metrics].mean(axis=1)
-variable_ps_round_z["attacking_transition_z"] = variable_ps_round_z[attacking_transition_metrics].mean(axis=1)
-variable_ps_round_z["attacking_z"] = variable_ps_round_z[attacking_metrics].mean(axis=1)
-variable_ps_round_z["chance_creation_z"] = variable_ps_round_z[chance_creation_metrics].mean(axis=1)
+# D12/D13: same STYLE_POLES as the team-level block.
+for _name, _p in STYLE_POLES.items():
+    _signed = pd.concat([variable_ps_round_z[_p["+"]], -variable_ps_round_z[_p["-"]]], axis=1)
+    variable_ps_round_z[_name] = _signed.mean(axis=1)
 
 # Get a list of the current columns
 cols = list(variable_ps_round_z.columns)
 
 # List of columns to be relocated
-cols_to_remove = ["defence_z", "defensive_transition_z", "attacking_transition_z", 
-                  "attacking_z", "chance_creation_z"]
+cols_to_remove = ["defence_z", "defensive_transition_z", "attacking_transition_z", "directness_z", "wide_play_z",
+                  "chance_creation_z"]
 
 # Remove these columns from the list
 for col in cols_to_remove:
@@ -9015,7 +4539,7 @@ variable_ps_round_z = variable_ps_round_z[cols]
 # Renaming columns
 columns_to_rename = ["round", "date", "fixture", "team_name",
                      "team_possession", "opponent_possession", "defence_z", "defensive_transition_z",
-                     "attacking_transition_z", "attacking_z", "chance_creation_z", "defensive_height_z", 
+                     "attacking_transition_z", "directness_z", "wide_play_z", "chance_creation_z", "defensive_height_z", 
                      "high_recoveries_%_z", "PPDA_z", "fouls_in_attacking_half_%_z","defensive_intensity_z",	
                      "avg_time_to_defensive_action_z", "counter_press_Success_Rate_%_z",
                      "transition_vulnerability_index_z", "opposition_final_third_entries_10s_z", 
@@ -9027,8 +4551,8 @@ columns_to_rename = ["round", "date", "fixture", "team_name",
                      ]
 
 columns_renamed = ["rodada", "data", "partida", "clube", "Posse (%)",
-                   "Posse adversário (%)", "Defesa", "Transição defensiva",
-                   "Transição ofensiva", "Ataque", "Criação de chances", 
+                   "Posse adversário (%)", "Bloco alto / agressivo", "Contrapressão imediata",
+                   "Transição vertical", "Jogo direto", "Jogo pelos lados", "Finalização precoce", 
                    "Altura defensiva (m)", "Recuperações de posse no último terço (%)", "PPDA", "Faltas no campo de ataque (%)",
                    "Intensidade defensiva", "Tempo médio ação defensiva (s)", "Sucesso da pressão pós perda (5s) (%)",
                    "Índice de Vulnerabilidade na Transição", "Entradas do adversário no último terço em 10s",
@@ -9040,6 +4564,7 @@ columns_renamed = ["rodada", "data", "partida", "clube", "Posse (%)",
                     ]
 
 # Create a dictionary mapping old names to new names
+assert len(columns_to_rename) == len(columns_renamed)
 rename_dict = dict(zip(columns_to_rename, columns_renamed))
 
 # Rename columns in variable_ps_round_z

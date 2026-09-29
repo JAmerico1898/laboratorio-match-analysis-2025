@@ -1,3 +1,4 @@
+# Superseded by MatchAnalysis_PlayStyle_2025.py; metric code not aligned with plataforma-scouting.
 #%%
 # MatchAnalysis 2025 — Orchestrator
 import pandas as pd
@@ -28,6 +29,35 @@ from scipy.stats import poisson
 
 pd.options.mode.chained_assignment = None
 warnings.filterwarnings('ignore')
+
+###############################################################################
+###############################################################################
+
+ws = sd.WhoScored(leagues="BRA-Brasileirão", seasons=2025)
+
+# Scrape all games and return a OptaLoader object
+loader = ws.read_events(output_fmt='loader')
+
+# Game events
+events = ws.read_events()
+
+# Game schedule
+df_schedule = ws.read_schedule()
+
+# Strip timezone from all datetime columns, then export
+df_schedule_export = df_schedule.copy()
+
+for col in df_schedule_export.select_dtypes(include=['datetimetz']).columns:
+    df_schedule_export[col] = df_schedule_export[col].dt.tz_localize(None)
+
+# Creating excel file to rodadas
+# Strip timezone from all datetime columns, then export
+df_schedule_export = df_schedule.copy()
+
+for col in df_schedule_export.select_dtypes(include=['datetimetz']).columns:
+    df_schedule_export[col] = df_schedule_export[col].dt.tz_localize(None)
+
+df_schedule_export.to_excel("df_schedule.xlsx", index=False)
 
 ###############################################################################
 ###############################################################################
@@ -124,16 +154,6 @@ for script in upstream_scripts:
         raise RuntimeError(f"{script} failed")
     print(f"  {script} completed")
 
-ws = sd.WhoScored(leagues="BRA-Brasileirão", seasons=2025)
-
-# Scrape all games and return a OptaLoader object
-loader = ws.read_events(output_fmt='loader')
-
-# Game events
-events = ws.read_events()
-
-# Game schedule
-df_schedule = ws.read_schedule()
 
 #####################################################################################
 #####################################################################################
@@ -4630,7 +4650,6 @@ variable_df_new.insert(0, "Temporada", 2025)
 ###########################################################################
 ###########################################################################
 
-# Building round column
 # Numbering rounds
 # 1. Load the rounds reference file and keep only the keys we need
 rodada_df = pd.read_excel('rodada_2025.xlsx')[['game_id', 'round']]
