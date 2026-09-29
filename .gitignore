@@ -1,0 +1,25 @@
+# Environments
+.venv312/
+__pycache__/
+*.pyc
+
+# Secrets / local settings
+.streamlit/secrets.toml
+**/.streamlit/secrets.toml
+.claude/settings.local.json
+
+# Large raw data (kept local)
+xG_Training_data/
+Brasileirão_2025/
+downloaded_files/
+
+# Office lock / temp files
+~$*
+*.lock
+
+# Intermediate reference frame (possession_chain.py -> xG/xT wrappers)
+_ref_stage01_2025.parquet
+
+# Baseline outputs and plan workspace (local only)
+.baseline/
+.superpowers/

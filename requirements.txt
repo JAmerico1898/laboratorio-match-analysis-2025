@@ -1,0 +1,10 @@
+pandas
+numpy
+statsmodels
+matplotlib
+mplsoccer
+soccerdata
+socceraction
+shapely
+scipy
+scikit-learn
